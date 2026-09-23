@@ -6,8 +6,8 @@ Compatible GTA2 version:
 - 27/04/2004 3:29PM 9.6.0.0
 
 ## Installation
-2. Copy your **real** 32-bit `ddraw.dll` from `C:\Windows\SysWOW64\ddraw.dll` into the GTA 2 installation folder and rename it to `real_ddraw.dll`.
-1. Drop custom  `ddraw.dll` from this project, next to `gta2.exe` (GTA 2 installation folder).
+1. Copy your **real** 32-bit `ddraw.dll` from `C:\Windows\SysWOW64\ddraw.dll` into the GTA 2 installation folder and rename it to `real_ddraw.dll`.
+2. Drop custom  `ddraw.dll` from this project, next to `gta2.exe` (GTA 2 installation folder).
 3. Drop `gta2_60fps.ini` also in same folder as `gta2.exe`.
 4. Launch the game.
 
