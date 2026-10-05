@@ -69,6 +69,25 @@ static uint32_t g_pumpSkips = 0;
 static double   g_lastDrawCPU = 16.0;    // EMA of scene-draw ms (updated in Hook_SceneDraw); gates the pump
 static double   g_pumpBudgetMs = 42.0;   // pumped-tick budget (ms); skip 2nd render if 2*drawCPU+4 exceeds it
 
+// ---- manual zoom: drive HEIGHT target [6]; engine propagates to [40]->[30..33]->[8..11] ----
+static bool     g_zoom = false;     // "zoom"
+static int32_t  g_zoomOffset = 0;         // persistent user offset (Q14), additive on speed-zoom base
+static int32_t  g_zoomStep = 2048;      // "zoomstep"  per-tick while held (0.125/tick)
+static int32_t  g_zoomMax = 73728;     // "zoommax"   +5.0  -> total height ~6.0
+static int32_t  g_zoomMin = 0;         // "zoommin"   0 = never dip below speed-zoom baseline
+static int      g_zoomKeys = 1;         // "zoomkeys"  0=numpad +/- , 1=main-row -/=
+static const int32_t Z_ENGINE_MAX = 14 << 14;   // 229376, straight from Camera_ClampZoom (5E3D54)
+
+// ---- gang / mission HUD arrow interp (screen-space marker slots) ---------
+static bool     g_doArrows = false;       // "arrows"
+static int32_t  g_arrowSnap = 120 << 14;   // "arrowsnap" px(Q14): per-tick delta above this => snap
+static uint32_t g_arrowWarn = 0;
+struct ArrowState { int32_t px = 0, py = 0, cx = 0, cy = 0; uint32_t tick = 0xFFFFFFFFu; bool wasEn = false; };
+static std::unordered_map<int32_t*, ArrowState> g_arrow;
+typedef int(__fastcall* fn_slots_t)(void*, void*);
+static fn_slots_t oSlots = nullptr;
+
+
 // ---- map-layer / tile-dedup profiler (diagnostic; flag: mapprofile, DEFAULT OFF) ----
 static bool     g_mapProfile = false;
 static LARGE_INTEGER g_qpf = { 0 };
@@ -80,7 +99,9 @@ typedef int(__fastcall* fn_maplayers_t)(void*, void*);
 static fn_maplayers_t oMapLayers = nullptr;
 typedef int(__fastcall* fn_tileadd_t)(void*, void*, void*, void*);
 static fn_tileadd_t oTileAdd = nullptr;
-struct { uintptr_t tick, render, logic, pos, pSession, pNextDue, pCarHead, pPedHead, dtor, scene, maplayers, tileadd, surf, spr2, ui, modegate; } g;
+struct { uintptr_t tick, render, logic, pos, pSession, pNextDue, pCarHead, pPedHead, dtor, scene, maplayers, tileadd, surf, spr2, ui, modegate, slots, camcommit; } g;
+
+
 
 static void UseHardcoded()
 {
@@ -96,6 +117,8 @@ static void UseHardcoded()
 	g.spr2 = 0x4B98B0;       // stacked/tall-sprite draw (object-bound)
 	g.ui = 0x4CA440;         // quit-menu overlay (~0 in gameplay)
 	g.modegate = 0x4CB290;   // sub_4CB290: frontend/gameplay res decision (unifyres hook target)
+	g.slots = 0x4C84C0;
+	g.camcommit = 0x41F2F0;
 }
 
 // ---- logging ----------------------------------------------------------
@@ -261,11 +284,13 @@ typedef void(__fastcall* fn_scene_t)(void*, void*);
 
 static fn_scene_t oSceneDraw = nullptr;
 
+void Crash_ReinstallSEHFilter();
+
 static void __fastcall Hook_SceneDraw(void* thisp, void* edx)
 {
 	DWORD t = timeGetTime();
 	oSceneDraw(thisp, edx);
-
+	Crash_ReinstallSEHFilter();   // Render_DrawScene tail just ran __CxxRestore... — re-arm NOW
 	DWORD d = timeGetTime() - t;
 	g_drawSum += d;
 
@@ -275,6 +300,22 @@ static void __fastcall Hook_SceneDraw(void* thisp, void* edx)
 	++g_sceneN;                          // PERF3 divisor (scene-draws per heartbeat)
 
 	g_lastDrawCPU = g_lastDrawCPU * 0.6 + (double)d * 0.4;
+}
+
+typedef int(__fastcall* fn_camcommit_t)(void*, void*);
+static fn_camcommit_t oCamCommit = nullptr;
+static int __fastcall Hook_CamCommit(void* thisp, void* edx)
+{
+	if (g_zoom && g_zoomOffset)
+		__try {
+		int32_t* cam = (int32_t*)thisp;
+		int32_t z = cam[6] + g_zoomOffset;          // [6] = staged height target
+		if (z > Z_ENGINE_MAX) z = Z_ENGINE_MAX;     // respect engine's own ceiling
+		if (z < 0) z = 0;
+		cam[6] = z;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	return oCamCommit(thisp, edx);
 }
 
 // ---- map-layer profiler hooks (only armed when childprofile/mapprofile=1) ----
@@ -355,6 +396,7 @@ static bool g_useDeadSet = true;
 typedef int(__fastcall* fn_dtor_t)(void*, void*);
 static fn_dtor_t oDtor = nullptr;
 
+
 static void LoadConfig()
 {
 	char path[MAX_PATH]; GetModuleFileNameA(GetModuleHandleA(nullptr), path, MAX_PATH);
@@ -384,7 +426,18 @@ static void LoadConfig()
 	g_capFps = (double)GetPrivateProfileIntA("60fps", "capfps", 60, path);
 	if (g_capFps < 1)
 		g_capFps = 60.0;
-	g_unifyRes = GetPrivateProfileIntA("60fps", "unifyres", 0, path) != 0;
+	g_unifyRes = GetPrivateProfileIntA("60fps", "unifyres", 1, path) != 0;
+
+	g_doArrows = GetPrivateProfileIntA("60fps", "arrows", 1, path) != 0;
+	{ int a = GetPrivateProfileIntA("60fps", "arrowsnap", 120, path); if (a < 1) a = 120; g_arrowSnap = a << 14; }
+	g_zoom = GetPrivateProfileIntA("60fps", "zoom", 1, path) != 0;
+	g_zoomOffset = GetPrivateProfileIntA("60fps", "zoom_offset", 0, path);
+	g_zoomStep = GetPrivateProfileIntA("60fps", "zoom_step", 2048, path);
+	g_zoomMax = GetPrivateProfileIntA("60fps", "zoom_max", 73728, path);
+	if (g_zoomMax > 73728)
+		g_zoomMax = 73728;
+	g_zoomMin = GetPrivateProfileIntA("60fps", "zoom_min", 0, path);
+	g_zoomKeys = GetPrivateProfileIntA("60fps", "zoom_keys", 1, path);
 }
 static void ForceDirtyNow(int32_t* d)
 {   // clear +72 on both caches NOW, before the draw
@@ -395,6 +448,7 @@ static void ForceDirtyNow(int32_t* d)
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+
 static DWORD  g_prevDue = 0;
 static DWORD g_frametime = 33;
 static DWORD g_lastPump = 0;
@@ -408,6 +462,7 @@ struct Obj
 	int32_t px = 0, py = 0, cx = 0, cy = 0; uint32_t tick = 0xFFFFFFFFu;
 	uint32_t moves = 0; uint32_t lastLive = 0;
 };
+
 
 static std::unordered_map<int32_t*, Obj> g_obj;
 static int __fastcall Hook_Dtor(void* thisp, void* edx)
@@ -666,6 +721,9 @@ static bool SafeRestore(int32_t* d, int32_t ox, int32_t oy, bool doDirty)
 		return false;
 	}
 }
+
+
+
 static LONG WINAPI Veh(EXCEPTION_POINTERS* ep)
 {
 	if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
@@ -772,6 +830,7 @@ static LONG WINAPI Uef(EXCEPTION_POINTERS* ep)
 	ChangeDisplaySettingsA(nullptr, 0);
 	return EXCEPTION_EXECUTE_HANDLER;
 }
+void Crash_ReinstallSEHFilter() { SetUnhandledExceptionFilter(Uef); }
 // ---- watchdog ---------------------------------------------------------
 static DWORD WINAPI Watchdog(LPVOID)
 {
@@ -805,15 +864,64 @@ static int32_t* CameraPhys()
 		return nullptr;
 	return (int32_t*)(e + 332);
 }
+// -----------------------
 static float Alpha()
 {
 	DWORD due = *(DWORD*)g.pNextDue;
 	DWORD ft = g_frametime ? g_frametime : 33;
 	double a = (double)(int)(timeGetTime() - (due - ft)) / (double)ft;
-
 	return a < 0 ? 0.f : (a > 1 ? 1.f : (float)a);
 }
-
+static int __fastcall Hook_Slots(void* thisp, void* edx)
+{
+	if (!g_doArrows) return oSlots(thisp, edx);
+	struct { int32_t* s; int32_t x, y; } touched[17];
+	int   nTouched = 0;
+	float al = Alpha();
+	for (int i = 0; i < 17; i++)
+	{
+		int32_t* s = (int32_t*)((char*)thisp + (size_t)124 * i);
+		uint8_t  en; int32_t liveX, liveY;
+		__try { en = *((uint8_t*)s + 45); liveX = s[0]; liveY = s[1]; }
+		__except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+		if (!en) {                                    // disabled: arm snap for the re-enable edge
+			auto it = g_arrow.find(s);
+			if (it != g_arrow.end()) it->second.wasEn = false;
+			continue;
+		}
+		ArrowState& a = g_arrow[s];
+		if (a.tick != g_tick) {                       // first render of a new tick: shift cur->prev
+			a.px = a.cx; a.py = a.cy;
+			a.cx = liveX; a.cy = liveY;
+			a.tick = g_tick;
+		}
+		else {                                      // pumped render, same tick: value must match
+			if ((liveX != a.cx || liveY != a.cy) && g_arrowWarn < 20) {
+				++g_arrowWarn;
+				Dbg("[ARW] per-render write?! i=%d tick=%u wasX=%d nowX=%d\n", i, g_tick, a.cx, liveX);
+			}
+			a.cx = liveX; a.cy = liveY;
+		}
+		if (!a.wasEn) { a.px = liveX; a.py = liveY; }  // enable edge: snap (prev is stale)
+		if (llabs((int64_t)a.cx - a.px) > g_arrowSnap ||
+			llabs((int64_t)a.cy - a.py) > g_arrowSnap) {
+			a.px = a.cx; a.py = a.cy;
+		}  // retarget/wrap: snap
+		a.wasEn = true;
+		int32_t lx = a.px + (int32_t)llround((double)(a.cx - a.px) * al);
+		int32_t ly = a.py + (int32_t)llround((double)(a.cy - a.py) * al);
+		__try {
+			s[0] = lx; s[1] = ly;
+			touched[nTouched].s = s; touched[nTouched].x = liveX; touched[nTouched].y = liveY; ++nTouched;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+	int r = oSlots(thisp, edx);
+	for (int i = 0; i < nTouched; i++)
+		__try { touched[i].s[0] = touched[i].x; touched[i].s[1] = touched[i].y; }
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	return r;
+}
 // ---- menu/gameplay resolution unifier (kills the mode-switch blink) ----
 // sub_4CB290 forces 640x480 whenever byte_595018 (frontend) is set, so menu(640) vs
 // gameplay(config) always differ across a transition -> Vid_CloseScreen + Vid_SetMode churn
@@ -880,6 +988,14 @@ static char __cdecl Hook_Logic()
 {
 	CP(10);
 	++g_tick;
+	if (g_zoom) {
+		int vkOut = g_zoomKeys ? VK_OEM_MINUS : VK_SUBTRACT;  // minus = zoom OUT = raise cam
+		int vkIn = g_zoomKeys ? VK_OEM_PLUS : VK_ADD;       // plus  = zoom IN
+		if (GetAsyncKeyState(vkOut) & 0x8000) g_zoomOffset += g_zoomStep;
+		if (GetAsyncKeyState(vkIn) & 0x8000) g_zoomOffset -= g_zoomStep;
+		if (g_zoomOffset > g_zoomMax) g_zoomOffset = g_zoomMax;
+		if (g_zoomOffset < g_zoomMin) g_zoomOffset = g_zoomMin;
+	}
 
 	{
 		DWORD t = timeGetTime();
@@ -1277,6 +1393,17 @@ static void Init()
 		if (MH_CreateHook((void*)g.surf, (void*)&Hook_Surf, (void**)&oSurf) != MH_OK) Dbg("[60] hook surf FAILED\n");
 		if (MH_CreateHook((void*)g.spr2, (void*)&Hook_Spr2, (void**)&oSpr2) != MH_OK) Dbg("[60] hook spr2 FAILED\n");
 		if (MH_CreateHook((void*)g.ui, (void*)&Hook_Ui, (void**)&oUi) != MH_OK) Dbg("[60] hook ui FAILED\n");
+	}
+	
+	if (g_doArrows)
+	{
+		if (MH_CreateHook((void*)g.slots, (void*)&Hook_Slots, (void**)&oSlots) != MH_OK)
+			Dbg("[60] hook slots(arrows) FAILED\n");
+	}
+	if (g_zoom)
+	{
+		if (MH_CreateHook((void*)g.camcommit, (void*)&Hook_CamCommit, (void**)&oCamCommit) != MH_OK)
+			Dbg("[60] hook camcommit(zoom) FAILED\n");
 	}
 
 	if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK)

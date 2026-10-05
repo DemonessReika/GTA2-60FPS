@@ -1,13 +1,19 @@
 # GTA2 60 FPS
-A `ddraw.dll` proxy that adds frame interpolation to *Grand Theft Auto 2*, smoothing the game out to 60 FPS without the infamous speed-up weirdness.
+A `ddraw.dll` proxy that adds frame interpolation to *Grand Theft Auto 2*, smoothing the game out to 60 FPS without the infamous speed-up weirdness  (Not DLSS related. No input lag!).
 Objects and the camera are interpolated between game ticks, so movement looks smooth while the underlying simulation runs exactly as it always did.
 
 Compatible GTA2 version:
 - 27/04/2004 3:29PM 9.6.0.0
+- Untested on newer versions
+
+# Changelog
+- v1.01 - Fixed mission markers stuttering. Added zoom-in/zoom-out with keyboard "-" and "+" buttons, can be disabled using .ini or swapped to numpad "-" and "+" keys instead
+- v1.00 - Initial Release
+
 
 ## Installation
-1. Copy your **real** 32-bit `ddraw.dll` from `C:\Windows\SysWOW64\ddraw.dll` into the GTA 2 installation folder and rename it to `real_ddraw.dll`.
-2. Drop custom  `ddraw.dll` from this project, next to `gta2.exe` (GTA 2 installation folder).
+1. Drop `ddraw.dll` next to `gta2.exe` (GTA 2 installation folder).
+2. Copy your **real** 32-bit `ddraw.dll` from `C:\Windows\SysWOW64\ddraw.dll` into the same folder and rename it to `real_ddraw.dll`.
 3. Drop `gta2_60fps.ini` also in same folder as `gta2.exe`.
 4. Launch the game.
 
