@@ -10,3 +10,5 @@ gta2_60fps.ini
 real_ddraw.dll [ the renamed SysWOW64 ddraw.dll ]
 ddraw.dll [the modded one from GTA2_60FPS_v1_01_RELEASE.zip]
 ```
+5. Adjust settings to your liking in gta2_60fps.ini
+6. Launch game and enjoy!

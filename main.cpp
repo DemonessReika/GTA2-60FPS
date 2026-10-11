@@ -8,8 +8,10 @@
 #include <cstdint>
 #include <cmath>
 #include <cstdlib>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <string>
 #include <cstring>
 #include <vector>
 #include <unordered_map>
@@ -46,6 +48,7 @@
 
 // ---- master toggles (ini: [60fps]) ------------------------------------
 static bool g_logEnabled = true;   // "log"  master log switch. 0 => no file, Dbg() is a no-op.
+static bool g_DumpOnCrash = false; // create dump file on crash
 
 // ---- [PERF3] 45A5A0 child decomposition (flag: childprofile, DEFAULT OFF) ----
 static bool     g_childProfile = false;
@@ -60,14 +63,47 @@ static fn_surf_t oSurf = nullptr; static fn_spr2_t oSpr2 = nullptr; static fn_ui
 static DWORD    g_perfT0 = 0, g_lastTickMs = 0, g_tickDtMax = 0, g_tickDtMin = 0xFFFFFFFF;
 static uint32_t g_renderN = 0, g_pumpN = 0;
 static double   g_renderDurSum = 0; static DWORD g_renderDurMax = 0;
+static bool g_debugLogic = false;
 
-// ---- adaptive pump (drawCPU-gated) ----
+// ---- adaptive pump (present-cost-gated) ----
 static bool     g_adaptivePump = true;
 static double   g_debt = 0.0;            // DIAGNOSTIC only now (not a gate)
 static DWORD    g_prevTickWall = 0;
 static uint32_t g_pumpSkips = 0;
-static double   g_lastDrawCPU = 16.0;    // EMA of scene-draw ms (updated in Hook_SceneDraw); gates the pump
-static double   g_pumpBudgetMs = 42.0;   // pumped-tick budget (ms); skip 2nd render if 2*drawCPU+4 exceeds it
+static double   g_lastDrawCPU = 16.0;    // EMA of Render_DrawScene ms (scene BUILD only; cheap, NOT the gate)
+static double   g_lastPresentCPU = 16.0; // EMA of FULL present (Hook_Render incl Flip/BitBlt); THIS gates the pump
+static double   g_pumpBudgetMs = 42.0;   // legacy knob (no longer gates; kept for ini compat + logging)
+
+// ---- fix car/ped/object flicker on spawn ----
+static uint32_t g_spawnWarmup = 3;   // "spawn_warmup": ticks to suppress interp after first appearance
+static uint32_t g_spawnSkips = 0;
+static int32_t g_maxMove = 4 << 14;   // "maxmove" tiles: lerp deltas bigger than this snap (relocate/recycle), never swoop
+
+// ---- map-layer / tile-dedup profiler (diagnostic; flag: mapprofile, DEFAULT OFF) ----
+static bool     g_mapProfile = false;
+static LARGE_INTEGER g_qpf = { 0 };
+static double   g_tscPerMs = 0.0;
+static uint32_t g_mapCalls = 0;
+static uint64_t g_dedupTsc = 0;      static uint32_t g_dedupCalls = 0;
+static uint64_t g_dedupScan = 0;     static uint32_t g_dedupMax = 0;
+
+// ---- gang / mission HUD arrow interp (screen-space marker slots) ---------
+static bool     g_doArrows = true;       // "arrows"
+static int32_t  g_arrowSnap = 120 << 14;   // "arrowsnap" px(Q14): per-tick delta above this => snap
+static uint32_t g_arrowWarn = 0;
+struct ArrowState { int32_t px = 0, py = 0, cx = 0, cy = 0; uint32_t tick = 0xFFFFFFFFu; bool wasEn = false; };
+static std::unordered_map<int32_t*, ArrowState> g_arrow;
+typedef int(__fastcall* fn_slots_t)(void*, void*);
+static fn_slots_t oSlots = nullptr;
+
+
+
+
+/// BONUS CONTENT 
+
+
+
+static bool g_tileListOptimization = true;   // ini "tilelist_opt"
 
 // ---- manual zoom: drive HEIGHT target [6]; engine propagates to [40]->[30..33]->[8..11] ----
 static bool     g_zoom = false;     // "zoom"
@@ -78,86 +114,252 @@ static int32_t  g_zoomMin = 0;         // "zoommin"   0 = never dip below speed-
 static int      g_zoomKeys = 1;         // "zoomkeys"  0=numpad +/- , 1=main-row -/=
 static const int32_t Z_ENGINE_MAX = 14 << 14;   // 229376, straight from Camera_ClampZoom (5E3D54)
 
-// ---- gang / mission HUD arrow interp (screen-space marker slots) ---------
-static bool     g_doArrows = false;       // "arrows"
-static int32_t  g_arrowSnap = 120 << 14;   // "arrowsnap" px(Q14): per-tick delta above this => snap
-static uint32_t g_arrowWarn = 0;
-struct ArrowState { int32_t px = 0, py = 0, cx = 0, cy = 0; uint32_t tick = 0xFFFFFFFFu; bool wasEn = false; };
-static std::unordered_map<int32_t*, ArrowState> g_arrow;
-typedef int(__fastcall* fn_slots_t)(void*, void*);
-static fn_slots_t oSlots = nullptr;
 
 
-// ---- map-layer / tile-dedup profiler (diagnostic; flag: mapprofile, DEFAULT OFF) ----
-static bool     g_mapProfile = false;
-static LARGE_INTEGER g_qpf = { 0 };
-static double   g_tscPerMs = 0.0;
-static uint32_t g_mapCalls = 0;
-static uint64_t g_dedupTsc = 0;      static uint32_t g_dedupCalls = 0;
-static uint64_t g_dedupScan = 0;     static uint32_t g_dedupMax = 0;
+// ---- HUD banner shrink (area-name + vehicle-name plaques) ----
+static bool    g_bannerShrink = false;   // ini "banner_shrink"
+static int     g_bannerPct = 75;     // ini "banner_scale" (percent; 100 = original)
+static double  g_bannerK = 0.75;
+static bool    g_inBanner = false;  // true only while a banner fn runs (main thread, sync)
+static bool    g_bannerUiPatched = false;
+static int32_t g_bannerSavedUi = 0;
+static int32_t g_bannerOffX = 0, g_bannerOffY = 0;   // Q14 virtual, added to x/y in shared draw fns
+
+// ---- banner dedup: suppress repeat area/car banners until map reload ----
+static bool g_bannerDedup = false;   // ini "banner_dedup"
+static bool g_bannerDedupCar = false;   // ini "banner_dedup_car"
+
+struct BannerDedupState
+{
+	std::unordered_set<std::wstring> seen;   // strings shown >=1x this level
+	std::wstring curEpisode;                 // string we've already decided on
+	bool curSuppressed = false;              // the decision for curEpisode
+};
+
+static BannerDedupState g_dedupArea, g_dedupCar;
+typedef char* (__fastcall* fn_levelstart_t)(void*, void*);
+typedef char* (__cdecl* fn_sessionteardown_t)();
+static fn_levelstart_t oLevelStart = nullptr;
+static fn_sessionteardown_t oSessionTeardown = nullptr;
+
+
+typedef void(__fastcall* fn_banner_t)(void*, void*);
+static fn_banner_t oAreaBanner = nullptr, oVehBanner = nullptr;
+typedef int(__stdcall* fn_drawicon_t)(int, int, int, int, int, int, int, int, int);
+typedef void(__stdcall* fn_drawsprite_t)(int, int, int, int, int, int, int, int);
+typedef void(__stdcall* fn_drawscaledstr_t)(int, int, int, int);
+static fn_drawicon_t      oDrawIcon = nullptr;
+static fn_drawsprite_t    oDrawSprite = nullptr;
+static fn_drawscaledstr_t oDrawScaledStr = nullptr;
+
+
+/// BONUS CONTENT ^
+
 typedef int(__fastcall* fn_maplayers_t)(void*, void*);
 static fn_maplayers_t oMapLayers = nullptr;
 typedef int(__fastcall* fn_tileadd_t)(void*, void*, void*, void*);
 static fn_tileadd_t oTileAdd = nullptr;
-struct { uintptr_t tick, render, logic, pos, pSession, pNextDue, pCarHead, pPedHead, dtor, scene, maplayers, tileadd, surf, spr2, ui, modegate, slots, camcommit; } g;
 
+
+struct {
+	uintptr_t tick, render, logic, pos, pSession, pNextDue, pCarHead, pPedHead, dtor, scene,
+		maplayers, tileadd, surf, spr2, ui, modegate, slots, camcommit,
+		areaBanner, vehBanner, drawIcon, drawSprite, drawScaledStr,
+		levelStart, sessionTeardown;
+} g;
 
 
 static void UseHardcoded()
 {
-	g.tick = 0x462A30; g.render = 0x461960; g.logic = 0x461930;
-	g.pos = 0x420600;
-	g.pSession = 0x5EB4FC; g.pNextDue = 0x662748;
-	g.pCarHead = 0x5E4CA0; g.pPedHead = 0x5E5BBC;
-	g.dtor = 0x4BDC40;
-	g.scene = 0x45A5A0;      // Render_DrawScene (parent; we time its whole cost as drawCPU)
-	g.maplayers = 0x472110;  // Render_MapLayers: 8-layer iso compositor (child; measured tiny)
-	g.tileadd = 0x46BB90;    // TileList_AddUnique: O(n^2) dedup — real but ~0.1ms, IRRELEVANT
-	g.surf = 0x4CAEC0;       // Render_SetupSurface (Vid_GetSurface + MakeScreenTable + gbh_SetWindow)
-	g.spr2 = 0x4B98B0;       // stacked/tall-sprite draw (object-bound)
-	g.ui = 0x4CA440;         // quit-menu overlay (~0 in gameplay)
-	g.modegate = 0x4CB290;   // sub_4CB290: frontend/gameplay res decision (unifyres hook target)
-	g.slots = 0x4C84C0;
-	g.camcommit = 0x41F2F0;
+	g.tick = 0x462A30;			// Game_FrameGate
+	g.render = 0x461960;		// Game_RenderPresent
+	g.logic = 0x461930;			// Game_LogicTick
+	g.pos = 0x420600;			// Disp::SetPos
+	g.pSession = 0x5EB4FC;		// g_session
+	g.pNextDue = 0x662748;		// g_nextTickDue
+	g.pCarHead = 0x5E4CA0;		// g_carPool
+	g.pPedHead = 0x5E5BBC;		// g_pedPool
+	g.dtor = 0x4BDC40;			// ~Disp:: (Disp object destructor)
+	g.scene = 0x45A5A0;			// Render_DrawScene (parent; we time its whole cost as drawCPU)
+	g.maplayers = 0x472110;		// Render_MapLayers: 8-layer iso compositor (child; measured tiny)
+	g.tileadd = 0x46BB90;		// TileList_AddUnique: O(n^2) dedup — real, scales with zoom-out
+	g.surf = 0x4CAEC0;			// Render_SetupSurface (Vid_GetSurface + MakeScreenTable + gbh_SetWindow)
+	g.spr2 = 0x4B98B0;			// Render_StackSprites: stacked/tall-sprite draw (object-bound)
+	g.ui = 0x4CA440;			// Hud_DrawAll: (ENTIRE HUD pass)
+	g.modegate = 0x4CB290;		// Vid_ModeGate: frontend/gameplay res decision (unifyres hook target)
+	g.slots = 0x4C84C0;			// Marker_DrawAll: Mission arrow stuff.
+	g.camcommit = 0x41F2F0;		// Camera::Commit
+	// --- v102: banner shrink ---
+	g.areaBanner = 0x4C9890;  // Hud_DrawAreaNameBanner    (Hud_DrawAll call #8)
+	g.vehBanner = 0x4C94F0;  // Hud_DrawVehicleNameBanner (Hud_DrawAll call #9)
+	g.drawIcon = 0x4C71B0;  // Hud_DrawIcon          (virtual Q14 -> *uiScale -> screen; plaques)
+	g.drawSprite = 0x4C7280;  // Hud_DrawSprite        (area-banner text)
+	g.drawScaledStr = 0x4BA2C0;  // Hud_DrawScaledString  (vehicle-banner text)
+	//
+	g.levelStart = 0x45B5F0;  // Level_SpawnAndStart (clears dedup sets on map change/restart)
+	g.sessionTeardown = 0x462060;	// Session_Teardown: Game exit or entering back main menu
 }
 
-// ---- logging ----------------------------------------------------------
 
+// ---- logging ----------------------------------------------------------
+// ---- async logging: lock-free MPSC ring + dedicated flush thread -------------------
+// Producers (game-loop hooks, Watchdog, VEH on ANY thread) only CLAIM->WRITE->PUBLISH a
+// slot. They never touch the file, never block, never lock. One flush thread drains to disk.
 static FILE* g_log = nullptr;
-static CRITICAL_SECTION g_logCs;
+static const uint32_t   LOG_SLOTS = 8192;        // ring depth (MUST be power of two)
+static const uint32_t   LOG_MASK = LOG_SLOTS - 1;
+static const uint32_t   LOG_PAYLOAD = 512;         // text bytes/slot (matches old b[512])
+struct LogSlot
+{
+	std::atomic<uint32_t> seq;      // Vyukov publish sequence
+	uint32_t              stamp;    // timeGetTime() at enqueue (real event time)
+	uint32_t              len;
+	char                  text[LOG_PAYLOAD];
+};
+static LogSlot* g_logRing = nullptr;
+static std::atomic<uint32_t> g_logEnq{ 0 };   // producers claim tickets here (CAS)
+static uint32_t              g_logDeq = 0;     // consumer cursor (guarded by g_logDrainCs)
+static std::atomic<uint32_t> g_logDrops{ 0 };
+static uint32_t              g_logDropsReported = 0;
+static CRITICAL_SECTION      g_logDrainCs;     // serialises the CONSUMER side only (flush thd vs crash drain)
+static HANDLE                g_logThread = nullptr;
+static volatile bool         g_logRun = true;
+static bool                  g_logMirrorODS = false;  // optional: flush thread also does OutputDebugStringA
 static void LogOpen()
 {
-	InitializeCriticalSection(&g_logCs);
+
 	char path[MAX_PATH];
 	GetModuleFileNameA(GetModuleHandleA(nullptr), path, MAX_PATH);
 	char* s = strrchr(path, '\\');
 	if (s) strcpy(s + 1, "gta2_60fps.log"); else strcpy(path, "gta2_60fps.log");
 	g_log = fopen(path, "w");
 }
-static void Dbg(const char* f, ...)
+// ---- producer: hot path, lock-free, reentrancy-safe --------------------
+void Dbg(const char* f, ...)
 {
-	if (!g_logEnabled) return;                 // master switch: log=0 => fully silent, ~zero cost
-	char b[512]; va_list a; va_start(a, f); vsnprintf(b, sizeof b, f, a); va_end(a);
-	OutputDebugStringA(b);
-	if (g_log)
+	if (!g_logEnabled) return;                      // master switch: ~free when off
+	char b[LOG_PAYLOAD];
+	va_list a; va_start(a, f);
+	int n = vsnprintf(b, sizeof b, f, a);           // MUST format here: varargs die after return
+	va_end(a);
+	if (n < 0) n = 0;
+	if (n > (int)sizeof(b) - 1) n = (int)sizeof(b) - 1;   // bytes actually in b
+	if (!g_logRing) return;                         // ring not up yet (very early boot)
+	uint32_t pos = g_logEnq.load(std::memory_order_relaxed);
+	for (;;)
 	{
-		EnterCriticalSection(&g_logCs);
-		fprintf(g_log, "[%u] %s", timeGetTime(), b);
-		fflush(g_log);
-		LeaveCriticalSection(&g_logCs);
+		LogSlot& s = g_logRing[pos & LOG_MASK];
+		uint32_t seq = s.seq.load(std::memory_order_acquire);
+		int32_t  dif = (int32_t)(seq - pos);
+		if (dif == 0)
+		{
+			if (g_logEnq.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed))
+			{
+				s.stamp = timeGetTime();
+				s.len = (uint32_t)n;
+				memcpy(s.text, b, n);
+				s.seq.store(pos + 1, std::memory_order_release);   // publish
+				return;
+			}
+			// CAS failed: 'pos' reloaded by ref -> loop
+		}
+		else if (dif < 0)
+		{
+			g_logDrops.fetch_add(1, std::memory_order_relaxed);    // ring full -> drop newest
+			return;
+		}
+		else
+		{
+			pos = g_logEnq.load(std::memory_order_relaxed);        // another producer won; retry
+		}
 	}
+}
+// ---- consumer: single-at-a-time (flush thread OR crash drain) ----------
+static bool LogPopLocked(LogSlot& out)   // caller holds g_logDrainCs
+{
+	uint32_t pos = g_logDeq;
+	LogSlot& s = g_logRing[pos & LOG_MASK];
+	uint32_t seq = s.seq.load(std::memory_order_acquire);
+	int32_t  dif = (int32_t)(seq - (pos + 1));
+	if (dif != 0) return false;                     // empty (dif<0)
+	out.stamp = s.stamp;
+	out.len = s.len > LOG_PAYLOAD ? LOG_PAYLOAD : s.len;
+	memcpy(out.text, s.text, out.len);
+	s.seq.store(pos + LOG_MASK + 1, std::memory_order_release);   // free slot for reuse
+	g_logDeq = pos + 1;
+	return true;
+}
+static void LogDrain(bool doFlush)
+{
+	if (!g_logRing) return;
+	EnterCriticalSection(&g_logDrainCs);
+	LogSlot tmp; bool any = false;
+	while (LogPopLocked(tmp))
+	{
+		any = true;
+		if (g_log) fprintf(g_log, "[%u] %.*s", tmp.stamp, (int)tmp.len, tmp.text);
+		if (g_logMirrorODS)
+		{
+			char line[LOG_PAYLOAD + 1];
+			int m = (int)(tmp.len > LOG_PAYLOAD ? LOG_PAYLOAD : tmp.len);
+			memcpy(line, tmp.text, m); line[m] = 0;
+			OutputDebugStringA(line);
+		}
+	}
+	uint32_t drops = g_logDrops.load(std::memory_order_relaxed);
+	if (drops != g_logDropsReported && g_log)
+	{
+		fprintf(g_log, "[%u] [LOG] *** %u msgs dropped (ring full) ***\n",
+			timeGetTime(), drops - g_logDropsReported);
+		g_logDropsReported = drops; any = true;
+	}
+	if (any && doFlush && g_log) fflush(g_log);
+	LeaveCriticalSection(&g_logDrainCs);
+}
+static DWORD WINAPI LogFlushThread(LPVOID)
+{
+	while (g_logRun) { LogDrain(true); Sleep(2); }  // simple poll; cheap
+	LogDrain(true);                                 // final drain on stop
+	return 0;
+}
+static void LogInitRing()
+{
+	InitializeCriticalSection(&g_logDrainCs);
+	g_logRing = new LogSlot[LOG_SLOTS];
+	for (uint32_t i = 0; i < LOG_SLOTS; i++)
+		g_logRing[i].seq.store(i, std::memory_order_relaxed);   // Vyukov init
+	g_logEnq.store(0, std::memory_order_relaxed);
+	g_logDeq = 0; g_logRun = true;
+	g_logThread = CreateThread(nullptr, 0, LogFlushThread, nullptr, 0, nullptr);
+}
+// best-effort drain for the fatal path: never hang death on a wedged flush thread
+static void LogDrainForCrash()
+{
+	if (!g_logRing) return;
+	g_logRun = false;                               // ask flush thread to stop looping
+	DWORD deadline = timeGetTime() + 300;
+	while (!TryEnterCriticalSection(&g_logDrainCs))
+	{
+		if ((int)(timeGetTime() - deadline) >= 0) return;   // give up; thread holds it (it's draining anyway)
+		Sleep(1);
+	}
+	LogSlot tmp;
+	while (LogPopLocked(tmp))
+		if (g_log) fprintf(g_log, "[%u] %.*s", tmp.stamp, (int)tmp.len, tmp.text);
+	if (g_log) fflush(g_log);
+	LeaveCriticalSection(&g_logDrainCs);
 }
 static const char* PrioName(DWORD c)
 {
 	switch (c)
 	{
-		case IDLE_PRIORITY_CLASS:	return "IDLE";
-		case BELOW_NORMAL_PRIORITY_CLASS:	return "BELOW_NORMAL";
-		case NORMAL_PRIORITY_CLASS:	return "NORMAL";
-		case ABOVE_NORMAL_PRIORITY_CLASS:	return "ABOVE_NORMAL";
-		case HIGH_PRIORITY_CLASS:	return "HIGH";
-		case REALTIME_PRIORITY_CLASS:	return "REALTIME";
-		default:	return "?";
+	case IDLE_PRIORITY_CLASS:	return "IDLE";
+	case BELOW_NORMAL_PRIORITY_CLASS:	return "BELOW_NORMAL";
+	case NORMAL_PRIORITY_CLASS:	return "NORMAL";
+	case ABOVE_NORMAL_PRIORITY_CLASS:	return "ABOVE_NORMAL";
+	case HIGH_PRIORITY_CLASS:	return "HIGH";
+	case REALTIME_PRIORITY_CLASS:	return "REALTIME";
+	default:	return "?";
 	}
 }
 static void LogParent()
@@ -234,10 +436,10 @@ static void LogLaunchEnv()
 	DWORD pc = GetPriorityClass(GetCurrentProcess());
 	Dbg("[ENV] priority=%s(0x%lX) dpiAware=%d\n", PrioName(pc), pc, (int)IsProcessDPIAware());
 	DWORD_PTR pm = 0, sm = 0;
-	
+
 	GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm);
 	Dbg("[ENV] affinity proc=0x%zX sys=0x%zX\n", (size_t)pm, (size_t)sm);   // read-only diagnostic (confirms raw launch = full affinity)
-	
+
 	LogParent();
 	LogModules();
 }
@@ -247,8 +449,8 @@ static void LogVideoMode()
 	static int lw = -1, lh = -1;
 	__try
 	{
-		int w = *(int*)0x673584 + 1;   // width-1  (set by sub_4CAEC0)
-		int h = *(int*)0x673474 + 1;   // height-1 (set by sub_4CAEC0)
+		int w = *(int*)0x673584 + 1;   // width-1  (set by Render_SetupSurface aka 0x4CAEC0)
+		int h = *(int*)0x673474 + 1;   // height-1 (set by Render_SetupSurface aka 0x4CAEC0)
 		if (w != lw || h != lh)
 		{
 			lw = w; lh = h;
@@ -258,7 +460,7 @@ static void LogVideoMode()
 			Dbg("[VID] backbuffer=%dx%d renderer=%s\n", w, h, r);
 			__try
 			{
-				uintptr_t base = *(uintptr_t*)0x673D20;               // engine surface struct
+				uintptr_t base = *(uintptr_t*)0x673D20;               // g_surface, engine surface struct
 				if (base > 0x10000 && base < 0x7FFFFFFF)
 				{
 					int w = *(int*)(base + 72), pitch = *(int*)(base + 84);
@@ -269,13 +471,184 @@ static void LogVideoMode()
 						: "EXCLUSIVE-FULLSCREEN(Flip) - SetDisplayMode active");
 				}
 			}
-			__except (EXCEPTION_EXECUTE_HANDLER){}
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
 		}
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-// ---- perf: scene-draw timing (isolates the render cost = drawCPU) ----
+// -----------------------------------------------------------------------
+// Audio file-cache warmer
+// Fixes stutter caused by loading sounds during active gameplay (Especially on HDDs)
+
+static uintptr_t g_pMilesDriver = 0x66C950;
+static bool LooksLikeAsciiPath(const char* s)
+{
+	if (!s) return false;
+	int n = 0;
+	for (; n < 120; ++n) {
+		char c = s[n]; if (!c) break;
+		if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7E) return false;
+	}
+	return n >= 2 && n < 120;
+}
+static bool ReadRadioPrefix(uintptr_t pMiles, char* out, size_t cap)
+{
+	if (!pMiles) return false;
+	__try {
+		const char* a = (const char*)(pMiles + 5);                 // form A: struct base, inline string
+		if (LooksLikeAsciiPath(a)) { lstrcpynA(out, a, (int)cap); return true; }
+		uintptr_t s = *(uintptr_t*)pMiles;                          // form B: pointer var -> deref
+		if (s > 0x10000 && s < 0x7FFFFFFF) {
+			const char* b = (const char*)(s + 5);
+			if (LooksLikeAsciiPath(b)) { lstrcpynA(out, b, (int)cap); return true; }
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	return false;
+}
+
+
+static volatile LONG g_audioWarmStarted = 0;
+static volatile LONG g_audioWarmFinished = 0;
+static HANDLE g_audioWarmThread = nullptr;
+struct WarmFileStats
+{
+	uint32_t files = 0;
+	uint64_t bytes = 0;
+	uint32_t failures = 0;
+};
+static bool GetGameDirectoryW(std::wstring& out)
+{
+	wchar_t path[MAX_PATH];
+	DWORD n = GetModuleFileNameW(
+		GetModuleHandleW(nullptr),
+		path,
+		ARRAYSIZE(path));
+	if (!n || n >= ARRAYSIZE(path))
+		return false;
+	wchar_t* slash = wcsrchr(path, L'\\');
+	if (!slash)
+		return false;
+	*slash = L'\0';
+	out.assign(path);
+	return true;
+}
+static void WarmOneFileW(const std::wstring& path, WarmFileStats& stats, uint64_t maxBytes /*0 = whole*/)
+{
+	HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+		OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+	if (h == INVALID_HANDLE_VALUE) { ++stats.failures; return; }
+	constexpr DWORD CHUNK = 64 * 1024;
+	std::vector<BYTE> buffer(CHUNK);
+	uint64_t total = 0;
+	for (;;) {
+		DWORD got = 0;
+		if (!ReadFile(h, buffer.data(), CHUNK, &got, nullptr)) { ++stats.failures; break; }
+		stats.bytes += got; total += got;
+		if (got == 0 || got < CHUNK) break;
+		if (maxBytes && total >= maxBytes) break;   // partial warm (AIL streams anyway)
+	}
+	CloseHandle(h); ++stats.files;
+}
+static void WarmDirectoryPatternW(const std::wstring& directory, const wchar_t* pattern,
+	WarmFileStats& stats, uint64_t maxBytes = 0)
+{
+	std::wstring search = directory; search += L"\\"; search += pattern;
+	WIN32_FIND_DATAW fd;
+	HANDLE find = FindFirstFileW(search.c_str(), &fd);
+	if (find == INVALID_HANDLE_VALUE) return;
+	do {
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+		std::wstring full = directory; full += L"\\"; full += fd.cFileName;
+		WarmOneFileW(full, stats, maxBytes);
+	} while (FindNextFileW(find, &fd));
+	FindClose(find);
+}
+static DWORD WINAPI WarmAudioThread(LPVOID)
+{
+	// This thread should never compete aggressively with the game thread.
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+	SetThreadPriorityBoost(GetCurrentThread(), TRUE);
+	std::wstring gameDir;
+	if (!GetGameDirectoryW(gameDir))
+	{
+		Dbg("[AUDIOWARM] unable to determine GTA2 directory\n");
+		InterlockedExchange(&g_audioWarmFinished, 1);
+		return 0;
+	}
+	const std::wstring audioDir = gameDir + L"\\data\\Audio";
+	const std::wstring vocalsDir = audioDir + L"\\Vocals";
+	const std::wstring gtaudioDir = gameDir + L"\\GTAudio";
+	WarmFileStats bankStats;
+	WarmFileStats vocalStats;
+	// Small banks first. These are likely to be used by the engine during
+	// level startup and should remain preferentially cached.
+	WarmDirectoryPatternW(audioDir, L"*.RAW", bankStats);
+	WarmDirectoryPatternW(audioDir, L"*.SDT", bankStats);
+	// Voice clips are the primary suspected source of the 200-250 ms hitch.
+	WarmDirectoryPatternW(vocalsDir, L"*.WAV", vocalStats);
+	// Radio files are large and can evict useful cache pages, so do these last.
+	// Radio: derive the real dir from g_milesDriver+5 instead of the bogus GTAudio glob.
+	WarmFileStats radioStats;
+	char prefix[MAX_PATH] = { 0 };
+	if (ReadRadioPrefix(g_pMilesDriver, prefix, sizeof prefix)) {
+		std::string p(prefix);
+		size_t slash = p.find_last_of("\\/");
+		std::string dirA = (slash == std::string::npos) ? std::string(".") : p.substr(0, slash);
+		std::wstring dirW(dirA.begin(), dirA.end());
+		if (dirW.size() < 2 || dirW[1] != L':') dirW = gameDir + L"\\" + dirW;   // relative -> anchor
+		Dbg("[AUDIOWARM] radio prefix=\"%s\" dir=\"%ls\"\n", prefix, dirW.c_str());
+		WarmDirectoryPatternW(dirW, L"*.WAV", radioStats, 1536u * 1024u);        // first ~1.5MB each
+	}
+	else {
+		Dbg("[AUDIOWARM] radio prefix UNAVAILABLE (set g_pMilesDriver = g_milesDriver address)\n");
+	}
+	Dbg(
+		"[AUDIOWARM] finished "
+		"banks=%u files/%llu bytes/%u failures, "
+		"vocals=%u files/%llu bytes/%u failures, "
+		"radio=%u files/%llu bytes/%u failures\n",
+		bankStats.files,
+		(unsigned long long)bankStats.bytes,
+		bankStats.failures,
+		vocalStats.files,
+		(unsigned long long)vocalStats.bytes,
+		vocalStats.failures,
+		radioStats.files,
+		(unsigned long long)radioStats.bytes,
+		radioStats.failures);
+	InterlockedExchange(&g_audioWarmFinished, 1);
+	return 0;
+}
+static void StartAudioWarm()
+{
+	// Only start one worker per process. The Windows cache survives level
+	// restarts, so repeating this is normally unnecessary.
+	if (InterlockedCompareExchange(&g_audioWarmStarted, 1, 0) != 0)
+		return;
+	g_audioWarmFinished = 0;
+	g_audioWarmThread = CreateThread(
+		nullptr,
+		0,
+		WarmAudioThread,
+		nullptr,
+		0,
+		nullptr);
+	if (!g_audioWarmThread)
+	{
+		InterlockedExchange(&g_audioWarmStarted, 0);
+		Dbg("[AUDIOWARM] CreateThread failed, error=%lu\n", GetLastError());
+		return;
+	}
+	Dbg("[AUDIOWARM] worker started\n");
+}
+
+
+
+
+// ---- perf: scene-draw timing (isolates the SCENE BUILD cost = drawCPU; NOT the present) ----
 static double   g_drawSum = 0;
 static DWORD g_drawMax = 0;
 static uint32_t g_drawN = 0;
@@ -318,6 +691,8 @@ static int __fastcall Hook_CamCommit(void* thisp, void* edx)
 	return oCamCommit(thisp, edx);
 }
 
+// log stuff
+
 // ---- map-layer profiler hooks (only armed when childprofile/mapprofile=1) ----
 static int __fastcall Hook_MapLayers(void* thisp, void* edx)
 {
@@ -340,27 +715,41 @@ static char __fastcall Hook_Ui(void* t, void* e)
 	LARGE_INTEGER a, b; QueryPerformanceCounter(&a);
 	char r = oUi(t, e); QueryPerformanceCounter(&b); g_qcUi += (b.QuadPart - a.QuadPart); return r;
 }
-static int __fastcall Hook_TileAddUnique(void* thisp, void* edx, void* a2, void* a3)
+
+// ---- Small performance bonus. Can cut up to 2 to 4 ms sometimes, especially with zoom out
+// Turns O(n^2) into O(n)
+struct TileXY { int32_t x, y; };
+static std::vector<TileXY> g_tiles;
+static const int TS_OFF = 256, TS_DIM = 768;          // covers tile coords -256..511
+static uint16_t g_tileStamp[TS_DIM][TS_DIM];           // ~1.1 MB, zero-init
+static uint16_t g_tileGen = 1;
+typedef void(__fastcall* fn_tiledraw_t)(void*, void*, int*, int*);
+static const fn_tiledraw_t Tile_DrawAt = (fn_tiledraw_t)0x471F20;
+typedef char(__fastcall* fn_tiledrain_t)(void*, void*);
+static fn_tiledrain_t oTileDrain = nullptr;
+static int __fastcall Hook_TileAddUnique(void* t, void* e, int* px, int* py)   // TileList_DrawUnique 0x46BB90
 {
-	uint32_t cnt = 0;
-	__try
-	{
-		cnt = ((volatile uint32_t*)thisp)[3007];
+	int x = *px, y = *py;
+	unsigned ux = (unsigned)(x + TS_OFF), uy = (unsigned)(y + TS_OFF);
+	if (ux < (unsigned)TS_DIM && uy < (unsigned)TS_DIM) {
+		uint16_t& st = g_tileStamp[uy][ux];
+		if (st == g_tileGen) return 0;             // already listed this layer
+		st = g_tileGen;
 	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
-	{
-		cnt = 0;
+	else {
+		for (size_t i = 0; i < g_tiles.size(); i++)  // way off-map: rare slow path
+			if (g_tiles[i].x == x && g_tiles[i].y == y) return 0;
 	}
-	if (cnt > g_dedupMax)
-		g_dedupMax = cnt;
-	g_dedupScan += cnt;
-	++g_dedupCalls;
-
-	uint64_t t0 = __rdtsc();
-	int r = oTileAdd(thisp, edx, a2, a3);
-	g_dedupTsc += (__rdtsc() - t0);
-
-	return r;
+	g_tiles.push_back({ x, y });
+	return 1;
+}
+static char __fastcall Hook_TileDrain(void* t, void* e)                        // TileList_Drain 0x4720E0
+{
+	for (size_t i = g_tiles.size(); i-- > 0; )        // engine draws newest -> oldest
+		Tile_DrawAt(t, e, &g_tiles[i].x, &g_tiles[i].y);
+	g_tiles.clear();
+	if (++g_tileGen == 0) { memset(g_tileStamp, 0, sizeof g_tileStamp); g_tileGen = 1; }
+	return 0;
 }
 // ---- freeze localizer -------------------------------------------------
 static volatile LONG g_cp = 0;
@@ -385,7 +774,7 @@ static double g_capFps = 60.0;
 static bool g_camZ = true;         // "cameraz": also interpolate camera HEIGHT [40] (ramps/elevation)
 static bool g_unifyRes = false;    // "unifyres": menu resolves to config res => no menu<->game blink
 
-static BYTE* const g_pFrontendFlag = (BYTE*)0x595018;  // byte_595018: 1 while frontend/menu active
+static BYTE* const g_pFrontendFlag = (BYTE*)0x595018;  // g_frontendActive: 1 while frontend/menu active
 
 static std::unordered_set<int32_t*> g_dead;
 
@@ -397,6 +786,8 @@ typedef int(__fastcall* fn_dtor_t)(void*, void*);
 static fn_dtor_t oDtor = nullptr;
 
 
+static bool g_Watchdog = false;
+
 static void LoadConfig()
 {
 	char path[MAX_PATH]; GetModuleFileNameA(GetModuleHandleA(nullptr), path, MAX_PATH);
@@ -405,9 +796,13 @@ static void LoadConfig()
 		strcpy(s + 1, "gta2_60fps.ini");
 	else
 		strcpy(path, "gta2_60fps.ini");
-
-	g_logEnabled = GetPrivateProfileIntA("60fps", "log", 1, path) != 0;
+	//
 	g_doPump = GetPrivateProfileIntA("60fps", "pump", 1, path) != 0;
+	g_adaptivePump = GetPrivateProfileIntA("60fps", "adaptivepump", 1, path) != 0;
+	g_pumpBudgetMs = (double)GetPrivateProfileIntA("60fps", "pumpbudget", 42, path);
+	if (g_pumpBudgetMs < 20)
+		g_pumpBudgetMs = 42.0;
+	
 	g_doObjs = GetPrivateProfileIntA("60fps", "objects", 1, path) != 0;
 	g_doCamera = GetPrivateProfileIntA("60fps", "camera", 1, path) != 0;
 	g_camZ = GetPrivateProfileIntA("60fps", "cameraz", 1, path) != 0;
@@ -415,21 +810,50 @@ static void LoadConfig()
 	g_useDeadSet = GetPrivateProfileIntA("60fps", "deadset", 1, path) != 0;
 	g_preDirty = GetPrivateProfileIntA("60fps", "predirty", 1, path) != 0;
 
-	g_adaptivePump = GetPrivateProfileIntA("60fps", "adaptivepump", 1, path) != 0;
-	g_pumpBudgetMs = (double)GetPrivateProfileIntA("60fps", "pumpbudget", 42, path);
-	if (g_pumpBudgetMs < 20)
-		g_pumpBudgetMs = 42.0;
 
-	g_mapProfile = GetPrivateProfileIntA("60fps", "mapprofile", 0, path) != 0;
-	g_childProfile = GetPrivateProfileIntA("60fps", "childprofile", 0, path) != 0;  // DEFAULT OFF
+	{
+		int m = GetPrivateProfileIntA("60fps", "maxmove", 4, path);
+		if (m < 1)
+			m = 4;
+		g_maxMove = m << 14;
+	}
+
+	g_doArrows = GetPrivateProfileIntA("60fps", "arrows", 1, path) != 0;
+	{
+		int a = GetPrivateProfileIntA("60fps", "arrowsnap", 120, path);
+		if (a < 1)
+			a = 120;
+		g_arrowSnap = a << 14;
+	}
 
 	g_capFps = (double)GetPrivateProfileIntA("60fps", "capfps", 60, path);
 	if (g_capFps < 1)
 		g_capFps = 60.0;
+
+	// tiles
+	g_tileListOptimization = GetPrivateProfileIntA("60fps", "tilelist_opt", 1, path) != 0;
+	
+
+	// audio
+	g_spawnWarmup = (uint32_t)GetPrivateProfileIntA("60fps", "spawn_warmup", 3, path);
+
+
 	g_unifyRes = GetPrivateProfileIntA("60fps", "unifyres", 1, path) != 0;
 
-	g_doArrows = GetPrivateProfileIntA("60fps", "arrows", 1, path) != 0;
-	{ int a = GetPrivateProfileIntA("60fps", "arrowsnap", 120, path); if (a < 1) a = 120; g_arrowSnap = a << 14; }
+	//
+	g_logEnabled = GetPrivateProfileIntA("60fps", "log", 1, path) != 0;
+	g_debugLogic = GetPrivateProfileIntA("60fps", "debug_logic", 0, path) != 0;
+	g_childProfile = GetPrivateProfileIntA("60fps", "childprofile", 0, path) != 0;
+	g_mapProfile = GetPrivateProfileIntA("60fps", "mapprofile", 0, path) != 0;
+
+
+	g_DumpOnCrash = GetPrivateProfileIntA("60fps", "dump_on_crash", 0, path) != 0;
+	g_Watchdog = GetPrivateProfileIntA("60fps", "stall_watchdog", 0, path) != 0;
+
+	//
+
+
+
 	g_zoom = GetPrivateProfileIntA("60fps", "zoom", 1, path) != 0;
 	g_zoomOffset = GetPrivateProfileIntA("60fps", "zoom_offset", 0, path);
 	g_zoomStep = GetPrivateProfileIntA("60fps", "zoom_step", 2048, path);
@@ -438,6 +862,18 @@ static void LoadConfig()
 		g_zoomMax = 73728;
 	g_zoomMin = GetPrivateProfileIntA("60fps", "zoom_min", 0, path);
 	g_zoomKeys = GetPrivateProfileIntA("60fps", "zoom_keys", 1, path);
+
+	g_bannerDedup = GetPrivateProfileIntA("60fps", "banner_dedup", 0, path) != 0;
+	g_bannerDedupCar = GetPrivateProfileIntA("60fps", "banner_dedup_car", 0, path) != 0;
+
+	g_bannerShrink = GetPrivateProfileIntA("60fps", "banner_shrink", 0, path) != 0;
+	g_bannerPct = GetPrivateProfileIntA("60fps", "banner_scale", 75, path);
+	if (g_bannerPct < 5)
+		g_bannerPct = 5;
+	if (g_bannerPct > 400)
+		g_bannerPct = 400;
+
+
 }
 static void ForceDirtyNow(int32_t* d)
 {   // clear +72 on both caches NOW, before the draw
@@ -461,6 +897,7 @@ struct Obj
 {
 	int32_t px = 0, py = 0, cx = 0, cy = 0; uint32_t tick = 0xFFFFFFFFu;
 	uint32_t moves = 0; uint32_t lastLive = 0;
+	uint32_t bornTick = 0xFFFFFFFFu;   // first tick we saw this slot (spawn-warmup anchor)
 };
 
 
@@ -534,18 +971,18 @@ static uintptr_t DeriveHead(uintptr_t base, int kind)
 	{
 		switch (kind)
 		{
-			case 0: return *(uintptr_t*)base;
-			case 1: return *(uintptr_t*)(base + 4);
-			case 2:
-			{
-				uintptr_t m = *(uintptr_t*)base;
-				return BadPtr(m) ? 0 : *(uintptr_t*)(m + 4);
-			}
-			case 3:
-			{
-				uintptr_t m = *(uintptr_t*)base;
-				return BadPtr(m) ? 0 : *(uintptr_t*)m;
-			}
+		case 0: return *(uintptr_t*)base;
+		case 1: return *(uintptr_t*)(base + 4);
+		case 2:
+		{
+			uintptr_t m = *(uintptr_t*)base;
+			return BadPtr(m) ? 0 : *(uintptr_t*)(m + 4);
+		}
+		case 3:
+		{
+			uintptr_t m = *(uintptr_t*)base;
+			return BadPtr(m) ? 0 : *(uintptr_t*)m;
+		}
 		}
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -611,8 +1048,8 @@ static void CalibratePed()
 
 		if (h)
 			WalkPed(h, 352, 360, 128, &valid, &hits, false);
-
-		Dbg("[CAL] ped kind=%d head=%08X valid=%d hits=%d\n", k, (unsigned)h, valid, hits);
+		if (g_debugLogic)
+			Dbg("[CAL] ped kind=%d head=%08X valid=%d hits=%d\n", k, (unsigned)h, valid, hits);
 		if (hits > bestHits)
 		{
 			bestHits = hits;
@@ -622,12 +1059,14 @@ static void CalibratePed()
 	if (best >= 0 && bestHits >= 3)
 	{
 		g_pedKind = best;
-		Dbg("[CAL] ped LATCHED kind=%d hits=%d\n", best, bestHits);
+		if (g_debugLogic)
+			Dbg("[CAL] ped LATCHED kind=%d hits=%d\n", best, bestHits);
 	}
 	else if (++g_pedTries >= MAX_TRIES)
 	{
 		g_pedKind = -2;
-		Dbg("[CAL] ped DISABLED after %d tries\n", g_pedTries);
+		if (g_debugLogic)
+			Dbg("[CAL] ped DISABLED after %d tries\n", g_pedTries);
 	}
 }
 static void CollectLive()
@@ -724,22 +1163,83 @@ static bool SafeRestore(int32_t* d, int32_t ox, int32_t oy, bool doDirty)
 
 
 
+static uintptr_t g_imgBase = 0x400000;
+static uintptr_t g_imgTop = 0;
+static uintptr_t g_selfBase = 0, g_selfTop = 0;   // our proxy ddraw module range
+static volatile LONG g_proxyFaultDumped = 0;      // one-shot deep dump of first in-proxy fault
+// Dedup: each unique faulting EIP logs ONCE (+ rare count). VEH fires on ANY thread, so keep it
+// lock-light & alloc-free (the insert race is benign). Turns 64MB of identical first-chance AVs
+// into a few lines that say WHERE, WHICH MODULE, and HOW MANY.
+static struct { uintptr_t eip; volatile LONG count; } g_faultSites[256];
+static volatile LONG g_faultSiteN = 0;
 static LONG WINAPI Veh(EXCEPTION_POINTERS* ep)
 {
-	if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+	if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+		return EXCEPTION_CONTINUE_SEARCH;
+	if (g_expectingFaults) { ++g_suppressedFaults; return EXCEPTION_CONTINUE_SEARCH; }
+	uintptr_t eip = ep->ContextRecord->Eip;
+	bool inGame = (eip >= g_imgBase && eip < g_imgTop);
+	bool inProxy = (g_selfBase && eip >= g_selfBase && eip < g_selfTop);
+	if (inProxy && InterlockedExchange(&g_proxyFaultDumped, 1) == 0)
 	{
-		if (g_expectingFaults)
+		if (g_debugLogic)
+			Dbg("[VEH] *** FIRST in-PROXY fault eip=%08X RVA=0x%X  <-- disASM this rva in ddraw.dll\n",
+				(unsigned)eip, (unsigned)(eip - g_selfBase));
+		if (g_debugLogic)
+			Dbg("[VEH]   eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X ebp=%08X esp=%08X\n",
+				ep->ContextRecord->Eax, ep->ContextRecord->Ebx, ep->ContextRecord->Ecx,
+				ep->ContextRecord->Edx, ep->ContextRecord->Esi, ep->ContextRecord->Edi,
+				ep->ContextRecord->Ebp, ep->ContextRecord->Esp);
+		uintptr_t sp = ep->ContextRecord->Esp;
+		for (int i = 0; i < 96; i++)
 		{
-			++g_suppressedFaults;
-			return EXCEPTION_CONTINUE_SEARCH;
+			uintptr_t p = sp + (uintptr_t)i * 4, v = 0; int ok = 1;
+			__try { v = *(volatile uintptr_t*)p; }
+			__except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+			if (!ok) break;
+			bool g2 = (v >= g_imgBase && v < g_imgTop);
+			bool px = (v >= g_selfBase && v < g_selfTop);
+			if (g2 || px)
+			{
+				if (g_debugLogic)
+					Dbg("[VEH]   stk+%02X = %08X  %s\n", i * 4, (unsigned)v, g2 ? "gta2.exe" : "proxy");
+			}
+		}
+	}
+	LONG n = g_faultSiteN, idx = -1;
+	for (LONG i = 0; i < n && i < 256; i++)
+		if (g_faultSites[i].eip == eip) { idx = i; break; }
+	LONG c;
+	if (idx < 0) {
+		idx = InterlockedIncrement(&g_faultSiteN) - 1;
+		if (idx < 256) { g_faultSites[idx].eip = eip; g_faultSites[idx].count = 1; c = 1; }
+		else c = 2;                      // table full -> never "first" -> stop logging new sites
+	}
+	else c = InterlockedIncrement(&g_faultSites[idx].count);
+	// first hit of each site, then rarely; ALWAYS log anything inside gta2.exe (that's the bug class we care about)
+	bool doLog = inGame || (c == 1) || (c % 100000 == 0);
+	if (doLog) {
+		char mod[64] = "?"; uintptr_t mb = 0; HMODULE hm = nullptr;
+		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			(LPCSTR)eip, &hm) && hm) {
+			char p[MAX_PATH]; GetModuleFileNameA(hm, p, MAX_PATH);
+			char* b = strrchr(p, '\\'); lstrcpynA(mod, b ? b + 1 : p, sizeof mod);
+			mb = (uintptr_t)hm;
 		}
 		ULONG_PTR* xi = ep->ExceptionRecord->ExceptionInformation;
-
-		Dbg("[VEH] AV %s target=%p eip=%08X | cp=%ld tick=%u lastObj=%p inRender=%d\n",
-			xi[0] ? "WRITE" : "READ", (void*)xi[1], ep->ContextRecord->Eip, g_cp, g_tick, g_lastObj, (int)g_inRender);
-		Dbg("[VEH] eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X\n",
-			ep->ContextRecord->Eax, ep->ContextRecord->Ebx, ep->ContextRecord->Ecx,
-			ep->ContextRecord->Edx, ep->ContextRecord->Esi, ep->ContextRecord->Edi);
+		if (g_debugLogic)
+			Dbg("[VEH] AV %s target=%p eip=%08X (%s+0x%X) %s #%ld | cp=%ld tick=%u inRender=%d\n",
+				xi[0] ? "WRITE" : "READ", (void*)xi[1], (unsigned)eip, mod,
+				(unsigned)(eip - mb), inGame ? "**GTA2**" : "sys/handled", c,
+				g_cp, g_tick, (int)g_inRender);
+		if (c == 1)
+		{
+			if (g_debugLogic)
+				Dbg("[VEH]   eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X\n",
+					ep->ContextRecord->Eax, ep->ContextRecord->Ebx, ep->ContextRecord->Ecx,
+					ep->ContextRecord->Edx, ep->ContextRecord->Esi, ep->ContextRecord->Edi);
+		}
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -749,8 +1249,6 @@ typedef BOOL(WINAPI* fn_MiniDumpWriteDump)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
 	PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
 
 static fn_MiniDumpWriteDump p_MiniDumpWriteDump = nullptr;
-static uintptr_t g_imgBase = 0x400000;
-static uintptr_t g_imgTop = 0;
 
 static void DumpStack(EXCEPTION_POINTERS* ep)
 {
@@ -768,12 +1266,12 @@ static void DumpStack(EXCEPTION_POINTERS* ep)
 			v = *(volatile uintptr_t*)p;
 			ok = 1;
 		}
-		
+
 		__except (EXCEPTION_EXECUTE_HANDLER)
 		{
 			ok = 0;
 		}
-		
+
 		if (!ok)
 			break;
 
@@ -783,6 +1281,9 @@ static void DumpStack(EXCEPTION_POINTERS* ep)
 }
 static void WriteDump(EXCEPTION_POINTERS* ep)
 {
+	if (!g_DumpOnCrash)
+		return;
+
 	if (!p_MiniDumpWriteDump)
 		return;
 
@@ -826,6 +1327,7 @@ static LONG WINAPI Uef(EXCEPTION_POINTERS* ep)
 			ep->ExceptionRecord->ExceptionCode, ep->ContextRecord->Eip, g_cp, g_tick, g_lastObj, (int)g_inRender);
 		DumpStack(ep);
 		WriteDump(ep);
+		LogDrainForCrash();   // <-- flush whatever's still in the ring, or the crash lines vanish
 	}
 	ChangeDisplaySettingsA(nullptr, 0);
 	return EXCEPTION_EXECUTE_HANDLER;
@@ -864,6 +1366,128 @@ static int32_t* CameraPhys()
 		return nullptr;
 	return (int32_t*)(e + 332);
 }
+//
+
+//
+// read the wide banner string at thisp+2; false if gate byte==0 or empty
+static bool BannerReadString(void* thisp, std::wstring& out)
+{
+	wchar_t buf[200]; int n = 0; bool ok = false;
+	__try {
+		if (*(const uint8_t*)thisp != 0) {
+			const wchar_t* s = (const wchar_t*)((const char*)thisp + 2);
+			for (; n < 199; n++) { wchar_t c = s[n]; if (!c) break; buf[n] = c; }
+			buf[n] = 0; ok = (n > 0);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { ok = false; n = 0; }
+	out.assign(buf, n);
+	return ok;
+}
+// returns true => SUPPRESS this draw (repeat banner)
+static bool BannerDedupCheck(BannerDedupState& st, void* thisp)
+{
+	std::wstring s;
+	if (!BannerReadString(thisp, s)) { st.curEpisode.clear(); return false; } // gone
+	if (s == st.curEpisode) return st.curSuppressed;                          // same episode
+	st.curEpisode = s;                                                        // NEW episode
+	bool suppress = (st.seen.find(s) != st.seen.end());
+	if (!suppress) st.seen.insert(s);
+	st.curSuppressed = suppress;
+	if (g_debugLogic)
+		Dbg("[BANNER] %s \"%ls\" (seen=%zu)\n", suppress ? "SUPPRESS" : "show", s.c_str(), st.seen.size());
+
+	return suppress;
+}
+static void BannerDedupReset()
+{
+	g_dedupArea.seen.clear(); g_dedupArea.curEpisode.clear(); g_dedupArea.curSuppressed = false;
+	g_dedupCar.seen.clear();  g_dedupCar.curEpisode.clear();  g_dedupCar.curSuppressed = false;
+	if(g_debugLogic)
+		Dbg("[60] banner dedup: sets cleared (level start)\n");
+}
+static char* __fastcall Hook_LevelStart(void* thisp, void* edx)
+{
+	Dbg("[Level] Level Start");
+	BannerDedupReset();
+	// Start after the level-start hook is entered so the warmer does not
+	// delay level initialization on the main thread.
+	StartAudioWarm();
+	return oLevelStart(thisp, edx);
+}
+
+static char* Hook_SessionTeardown()
+{
+	Dbg("[Level] Level End/Game Quit?\n");
+	return oSessionTeardown();
+}
+// ---------- goal 1: banner shrink (scale-about-center) ----------
+static void BannerBegin(int cyInt)
+{
+	g_bannerK = (double)g_bannerPct / 100.0;
+	if (g_bannerK < 0.05) g_bannerK = 0.05;
+	if (g_bannerK > 4.0)  g_bannerK = 4.0;
+	double inv = 1.0 / g_bannerK - 1.0;
+	g_bannerOffX = (int32_t)llround((double)((int64_t)320 << 14) * inv);   // horiz center = 320
+	g_bannerOffY = (int32_t)llround((double)((int64_t)cyInt << 14) * inv);   // vert anchor per-banner
+	g_bannerUiPatched = false;
+	int32_t* cam = CameraPhys();
+	if (cam)
+		__try {
+		g_bannerSavedUi = cam[42];
+		cam[42] = (int32_t)llround((double)g_bannerSavedUi * g_bannerK);
+		g_bannerUiPatched = true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { g_bannerUiPatched = false; }
+	g_inBanner = true;
+}
+static void BannerEnd()
+{
+	g_inBanner = false;
+	if (g_bannerUiPatched) {
+		int32_t* cam = CameraPhys();
+		if (cam) __try { cam[42] = g_bannerSavedUi; }
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
+		g_bannerUiPatched = false;
+	}
+}
+static void __fastcall Hook_AreaBanner(void* thisp, void* edx)
+{
+	if (g_bannerDedup && BannerDedupCheck(g_dedupArea, thisp)) return;   // repeat -> skip
+	if (!g_bannerShrink) { oAreaBanner(thisp, edx); return; }
+	BannerBegin(27);
+	__try { oAreaBanner(thisp, edx); }
+	__finally { BannerEnd(); }
+}
+static void __fastcall Hook_VehBanner(void* thisp, void* edx)
+{
+	if (g_bannerDedup && g_bannerDedupCar && BannerDedupCheck(g_dedupCar, thisp)) return;   // repeat -> skip
+	if (!g_bannerShrink) { oVehBanner(thisp, edx); return; }
+	int cy = 10;
+	__try { cy = ((int*)thisp)[18]; }
+	__except (EXCEPTION_EXECUTE_HANDLER) { cy = 10; }
+	BannerBegin(cy);
+	__try { oVehBanner(thisp, edx); }
+	__finally { BannerEnd(); }
+}
+// the 3 shared primitives: add the center-pin offset ONLY while a banner is drawing
+static int __stdcall Hook_DrawIcon(int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8, int a9)
+{
+	if (g_inBanner) { a3 += g_bannerOffX; a4 += g_bannerOffY; }   // a3=x, a4=y (Q14 virtual)
+	return oDrawIcon(a1, a2, a3, a4, a5, a6, a7, a8, a9);
+}
+static void __stdcall Hook_DrawSprite(int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8)
+{
+	if (g_inBanner) { a2 += g_bannerOffX; a3 += g_bannerOffY; }   // a2=x, a3=y
+	oDrawSprite(a1, a2, a3, a4, a5, a6, a7, a8);
+}
+static void __stdcall Hook_DrawScaledStr(int a1, int a2, int a3, int a4)
+{
+	if (g_inBanner) { a2 += g_bannerOffX; a3 += g_bannerOffY; }   // a2=x, a3=y
+	oDrawScaledStr(a1, a2, a3, a4);
+}
+
+
 // -----------------------
 static float Alpha()
 {
@@ -875,12 +1499,14 @@ static float Alpha()
 static int __fastcall Hook_Slots(void* thisp, void* edx)
 {
 	if (!g_doArrows) return oSlots(thisp, edx);
+	if (BadPtr((uintptr_t)thisp)) return oSlots(thisp, edx);   // never probe a junk base
 	struct { int32_t* s; int32_t x, y; } touched[17];
 	int   nTouched = 0;
 	float al = Alpha();
 	for (int i = 0; i < 17; i++)
 	{
 		int32_t* s = (int32_t*)((char*)thisp + (size_t)124 * i);
+		if (BadPtr((uintptr_t)s)) continue;                   // guard BEFORE the read, not just __except
 		uint8_t  en; int32_t liveX, liveY;
 		__try { en = *((uint8_t*)s + 45); liveX = s[0]; liveY = s[1]; }
 		__except (EXCEPTION_EXECUTE_HANDLER) { continue; }
@@ -898,7 +1524,8 @@ static int __fastcall Hook_Slots(void* thisp, void* edx)
 		else {                                      // pumped render, same tick: value must match
 			if ((liveX != a.cx || liveY != a.cy) && g_arrowWarn < 20) {
 				++g_arrowWarn;
-				Dbg("[ARW] per-render write?! i=%d tick=%u wasX=%d nowX=%d\n", i, g_tick, a.cx, liveX);
+				if(g_debugLogic)
+					Dbg("[ARW] per-render write?! i=%d tick=%u wasX=%d nowX=%d\n", i, g_tick, a.cx, liveX);
 			}
 			a.cx = liveX; a.cy = liveY;
 		}
@@ -923,7 +1550,7 @@ static int __fastcall Hook_Slots(void* thisp, void* edx)
 	return r;
 }
 // ---- menu/gameplay resolution unifier (kills the mode-switch blink) ----
-// sub_4CB290 forces 640x480 whenever byte_595018 (frontend) is set, so menu(640) vs
+// Vid_ModeGate (0x4CB290) forces 640x480 whenever g_frontendActive (frontend) is set, so menu(640) vs
 // gameplay(config) always differ across a transition -> Vid_CloseScreen + Vid_SetMode churn
 // = the ~5s monitor resync. Clearing the flag ONLY across this call makes the menu resolve to
 // config res too -> menu==gameplay -> no reconcile -> no blink. Restore immediately; the rest of
@@ -960,7 +1587,8 @@ static int __fastcall Hook_Pos(void* thisp, void* edx, int x, int y, int z)
 		if (g_reentryLog < 50)
 		{
 			g_reentryLog++;
-			Dbg("[60] !! setter DURING render this=%p ra=%p\n", thisp, _ReturnAddress());
+			if(g_debugLogic)
+				Dbg("[60] !! setter DURING render this=%p ra=%p\n", thisp, _ReturnAddress());
 		}
 		return oPos(thisp, edx, x, y, z);
 	}
@@ -969,6 +1597,7 @@ static int __fastcall Hook_Pos(void* thisp, void* edx, int x, int y, int z)
 		int32_t* d = (int32_t*)thisp;
 		g_dead.erase(d);
 		Obj& s = g_obj[d];
+		if (s.bornTick == 0xFFFFFFFFu) s.bornTick = g_tick;   // anchor the warmup window
 		if (s.tick != g_tick)
 		{
 			s.px = s.cx;
@@ -1039,9 +1668,10 @@ static char __cdecl Hook_Logic()
 	CP(13);
 	if ((g_tick % 30) == 0)
 	{
-		Dbg("[60] tick#%u moved=%zu objs=%zu carLive=%d carMiss=%u dtor=%u deadN=%zu dualw=%u a=%.2f\n",
-			g_tick, g_moved.size(), g_obj.size(), g_liveCar, g_carMiss,
-			g_dtorHits, g_dead.size(), g_dualCount, Alpha());
+		if (g_debugLogic)
+			Dbg("[60] tick#%u moved=%zu objs=%zu carLive=%d carMiss=%u dtor=%u deadN=%zu dualw=%u a=%.2f\n",
+				g_tick, g_moved.size(), g_obj.size(), g_liveCar, g_carMiss,
+				g_dtorHits, g_dead.size(), g_dualCount, Alpha());
 		char hb[512];
 		int off = 0;
 
@@ -1056,17 +1686,15 @@ static char __cdecl Hook_Logic()
 					off += w;
 			}
 		}
-
-		Dbg("[HIST] setter kind:seen/move/lerp(dead)  %s\n", hb[0] ? hb : "(none)");
-
+		if (g_debugLogic)
+			Dbg("[HIST] setter kind:seen/move/lerp(dead)  %s\n", hb[0] ? hb : "(none)");
 		DWORD now = timeGetTime();
 		DWORD w = g_perfT0 ? now - g_perfT0 : 0;
-
-		Dbg("[PERF] ticks/s=%.1f fps=%.1f pumps=%u | tickDt min=%u max=%u | rDur avg=%.2f max=%u ms | ftMeas=%u\n",
-			w ? 30000.0 / w : 0, w ? g_renderN * 1000.0 / w : 0, g_pumpN,
-			g_tickDtMin == 0xFFFFFFFF ? 0 : g_tickDtMin, g_tickDtMax,
-			g_renderN ? g_renderDurSum / g_renderN : 0, g_renderDurMax, g_frametime);
-
+		if (g_debugLogic)
+			Dbg("[PERF] ticks/s=%.1f fps=%.1f pumps=%u | tickDt min=%u max=%u | rDur avg=%.2f max=%u ms | ftMeas=%u\n",
+				w ? 30000.0 / w : 0, w ? g_renderN * 1000.0 / w : 0, g_pumpN,
+				g_tickDtMin == 0xFFFFFFFF ? 0 : g_tickDtMin, g_tickDtMax,
+				g_renderN ? g_renderDurSum / g_renderN : 0, g_renderDurMax, g_frametime);
 		g_perfT0 = now;
 		g_tickDtMax = 0;
 		g_tickDtMin = 0xFFFFFFFF;
@@ -1074,16 +1702,14 @@ static char __cdecl Hook_Logic()
 		g_pumpN = 0;
 		g_renderDurSum = 0;
 		g_renderDurMax = 0;
-
-		Dbg("[PERF2] drawCPU avg=%.2f max=%u (n=%u) ema=%.1f budget=%.0f | debt=%.0f skips=%u | mode673E2C=%d fskip673598=%d\n",
-			g_drawN ? g_drawSum / g_drawN : 0.0, g_drawMax, g_drawN, g_lastDrawCPU, g_pumpBudgetMs, g_debt, g_pumpSkips,
-			*(int*)0x673E2C, *(BYTE*)0x673598);
-
+		if (g_debugLogic)
+			Dbg("[PERF2] drawCPU avg=%.2f max=%u (n=%u) drawEMA=%.1f presentEMA=%.1f | pumpBudget=%.0f debt=%.0f skips=%u | mode673E2C=%d fskip673598=%d\n",
+				g_drawN ? g_drawSum / g_drawN : 0.0, g_drawMax, g_drawN, g_lastDrawCPU, g_lastPresentCPU, g_pumpBudgetMs, g_debt, g_pumpSkips,
+				*(int*)0x673E2C, *(BYTE*)0x673598);	// 0x673E2C = g_bMultiplayer, 0x673598 = g_frameSkipEnable
 		g_drawSum = 0;
 		g_drawMax = 0;
 		g_drawN = 0;
 		g_pumpSkips = 0;
-
 		if (g_mapProfile || g_childProfile)
 		{
 			double invF = g_qpf.QuadPart ? 1000.0 / (double)g_qpf.QuadPart : 0.0;
@@ -1092,28 +1718,25 @@ static char __cdecl Hook_Logic()
 			double spr2Ms = (double)g_qcSpr2 * invF / sn, uiMs = (double)g_qcUi * invF / sn;
 			if (g_childProfile)
 			{
-				uint32_t daNow = *(uint32_t*)0x5E8B78, ddNow = *(uint32_t*)0x5E8B7C;
+				uint32_t daNow = *(uint32_t*)0x5E8B78, ddNow = *(uint32_t*)0x5E8B7C;	// timer_displayAdd, timer_displayDraw
 				uint32_t da = daNow - g_daPrev;
 				uint32_t dd = ddNow - g_ddPrev;
-				
+
 				g_daPrev = daNow; g_ddPrev = ddNow;
-				
+
 				double child = surfMs + mapMs + spr2Ms + uiMs;
-				
+
 				Dbg("[PERF3] surf=%.2f map=%.2f spr2=%.2f ui=%.2f | child=%.2f remain=%.2f | drawEMA=%.1f engAdd=%u engDraw=%u (n=%u)\n",
 					surfMs, mapMs, spr2Ms, uiMs, child, g_lastDrawCPU - child, g_lastDrawCPU, da, dd, sn);
 			}
-
 			if (g_mapProfile)
 			{
 				double dedupMs = (g_mapCalls && g_tscPerMs > 0) ? ((double)g_dedupTsc / g_tscPerMs) / g_mapCalls : 0;
 				double ratio = g_dedupCalls ? (double)g_dedupScan / g_dedupCalls : 0;
-
 				Dbg("[MAP] map=%.2f | dedup=%.2fms/f ratio=%.0f maxN=%u\n", mapMs, dedupMs, ratio, g_dedupMax);
 			}
 			g_qcSurf = g_qcMap = g_qcSpr2 = g_qcUi = 0;
 			g_sceneN = 0;
-
 			g_mapCalls = g_dedupCalls = g_dedupMax = 0;
 			g_dedupTsc = g_dedupScan = 0;
 		}
@@ -1128,7 +1751,8 @@ static char __cdecl Hook_Render()
 	++g_frame;
 	if (g_logEnabled && g_frame == 5)
 	{   // fire early so a quick quit still captures env
-		Dbg("[ENV] screen=%dx%d\n", GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+		if(g_debugLogic)
+			Dbg("[ENV] screen=%dx%d\n", GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
 		EnumWindows(EnumWndProc, 0);
 	}
 
@@ -1168,14 +1792,14 @@ static char __cdecl Hook_Render()
 			g_lastObj = d; CP(23);
 
 			auto it = g_obj.find(d);
-			
+
 			if (it == g_obj.end())
 				continue;
 
 			Obj& s = it->second;
 
 			int kk = SafeKind(d);
-			
+
 			if (kk < 0 || kk > 15)
 				kk = 15;
 
@@ -1204,7 +1828,10 @@ static char __cdecl Hook_Render()
 				{
 					++g_missCount;
 					if ((g_missCount % 400) == 1)
-						Dbg("[MISS] persistent mover NEVER live d=%p moves=%u cur=(%d,%d)\n", d, s.moves, s.cx, s.cy);
+					{
+						if(g_debugLogic)
+							Dbg("[MISS] persistent mover NEVER live d=%p moves=%u cur=(%d,%d)\n", d, s.moves, s.cx, s.cy);
+					}
 				}
 				continue;
 			}
@@ -1215,9 +1842,23 @@ static char __cdecl Hook_Render()
 			if (s.px == s.cx && s.py == s.cy)
 				continue;
 
-			if (llabs((int64_t)s.cx - s.px) > TELE || llabs((int64_t)s.cy - s.py) > TELE)
+			int64_t dxv = llabs((int64_t)s.cx - s.px);
+			int64_t dyv = llabs((int64_t)s.cy - s.py);
+			if (dxv > TELE || dyv > TELE)
+				continue;                                    // warp / level jump
+			if (dxv > g_maxMove || dyv > g_maxMove)          // relocate / recycled slot: snap, never swoop
+			{
+				if (g_debugLogic)
+					Dbg("[SNAP] d=%p age=%u k=%d dx=%.1f dy=%.1f (tiles) px=(%d,%d) cx=(%d,%d) cam=(%d,%d)\n",
+						d, (unsigned)(g_tick - s.bornTick), SafeKind(d),
+						dxv / 16384.0, dyv / 16384.0, s.px, s.py, s.cx, s.cy, g_savedXY[0], g_savedXY[1]);
 				continue;
-
+			}
+			if ((uint32_t)(g_tick - s.bornTick) < g_spawnWarmup)   // fresh spawn settle (dtor'd slots)
+			{
+				++g_spawnSkips;
+				continue;
+			}
 			int32_t lx = s.px + (int32_t)llround((double)(s.cx - s.px) * a);
 			int32_t ly = s.py + (int32_t)llround((double)(s.cy - s.py) * a);
 
@@ -1234,14 +1875,20 @@ static char __cdecl Hook_Render()
 				{
 					++g_dualCount;
 					if ((g_dualCount % 400) == 1)
-						Dbg("[DUALW] d=%p tracked=(%d,%d) actual=(%d,%d)\n", d, s.cx, s.cy, ox, oy);
+					{
+						if (g_debugLogic)
+							Dbg("[DUALW] d=%p tracked=(%d,%d) actual=(%d,%d)\n", d, s.cx, s.cy, ox, oy);
+					}
 				}
 			}
 			else
 			{
 				static int n = 0;
 				if (n++ < 50)
-					Dbg("[SEH] dead obj on WRITE d=%p tick=%u\n", d, g_tick);
+				{
+					if(g_debugLogic)
+						Dbg("[SEH] dead obj on WRITE d=%p tick=%u\n", d, g_tick);
+				}
 			}
 		}
 	}
@@ -1268,11 +1915,14 @@ static char __cdecl Hook_Render()
 	if (rd > g_renderDurMax)
 		g_renderDurMax = rd;
 	++g_renderN;
-
+	g_lastPresentCPU = g_lastPresentCPU * 0.6 + (double)rd * 0.4;   // <-- feeds the pump gate (FULL present cost, incl BitBlt/flip)
 	return r;
 }
+
+
 static char __cdecl Hook_Tick()
 {
+
 	CP(1);
 	char r = oTick();
 	DWORD due = *(DWORD*)g.pNextDue;
@@ -1284,9 +1934,15 @@ static char __cdecl Hook_Tick()
 			g_frametime = ft;
 		g_prevDue = due;
 	}
-
-	bool canAfford = !g_adaptivePump || (g_lastDrawCPU * 2.0 + 4.0) <= g_pumpBudgetMs;
-	if (g_doPump && canAfford && CameraPhys() && (int)(due - now) > 6)
+	// Gate on the REAL present cost (g_lastPresentCPU = EMA of the whole Game_RenderPresent incl
+	// Flip/BitBlt), NOT scene-build (g_lastDrawCPU, which is cheap and never sees the blit). Only
+	// fire a 2nd present if a full one fits before the next logic tick is due. On the 16-bit shim
+	// backend this correctly REFUSES most pumps (present is expensive); fix the backend and present
+	// collapses, need drops, pumps fire freely. Same knob, honest number.
+	int timeLeft = (int)(due - now);                              // handles DWORD wrap for small deltas
+	int need = g_adaptivePump ? (int)(g_lastPresentCPU + 3.0) : 6;
+	if (need < 6) need = 6;                                       // keep the old 6ms floor
+	if (g_doPump && CameraPhys() && timeLeft > need)
 	{
 		DWORD cap = (DWORD)(1000.0 / g_capFps);
 		if ((now - g_lastPump) >= cap)
@@ -1294,10 +1950,10 @@ static char __cdecl Hook_Tick()
 			g_lastPump = now;
 			++g_pumpN;
 			CP(2);
-			((fn_t)g.render)(); 
+			((fn_t)g.render)();
 		}
 	}
-	else if (g_doPump && !canAfford)
+	else if (g_doPump)
 	{
 		++g_pumpSkips;
 	}
@@ -1307,9 +1963,7 @@ static char __cdecl Hook_Tick()
 static void Init()
 {
 	LoadConfig();                       // read ini FIRST (sets g_logEnabled, ...)
-	
-	if (g_logEnabled)
-		LogOpen();
+	if (g_logEnabled) { LogOpen(); LogInitRing(); }
 
 	AddVectoredExceptionHandler(1, Veh);
 	SetUnhandledExceptionFilter(Uef);
@@ -1326,29 +1980,21 @@ static void Init()
 
 	Dbg("[60] ==== ddraw proxy start ==== pump=%d(adapt=%d,budget=%.0f) objs=%d cam=%d camz=%d fdirty=%d predirty=%d unifyres=%d deadset=%d log=%d child=%d map=%d cap=%.0f\n",
 		g_doPump, g_adaptivePump, g_pumpBudgetMs, g_doObjs, g_doCamera, g_camZ, g_forceDirty, g_preDirty, g_unifyRes, g_useDeadSet, g_logEnabled, g_childProfile, g_mapProfile, g_capFps);
-	
 	timeBeginPeriod(1);
 	QueryPerformanceFrequency(&g_qpf);
-
 	if (g_mapProfile)
 	{
 		LARGE_INTEGER q0, q1;
 		uint64_t t0, t1;
-
 		QueryPerformanceCounter(&q0);
 		t0 = __rdtsc();
-
 		Sleep(50);
 		t1 = __rdtsc();
 		QueryPerformanceCounter(&q1);
-
 		double qms = g_qpf.QuadPart ? (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)g_qpf.QuadPart : 1.0;
-
 		g_tscPerMs = qms > 0.0 ? (double)(t1 - t0) / qms : 0.0;
-
 		Dbg("[MAP] tsc calib: %.0f tsc/ms (qpf=%lld)\n", g_tscPerMs, (long long)g_qpf.QuadPart);
 	}
-
 	UseHardcoded();
 
 	g_obj.reserve(4096);
@@ -1358,7 +2004,9 @@ static void Init()
 	g_liveVec.reserve(4096);
 	g_dead.reserve(4096);
 
-	CreateThread(nullptr, 0, Watchdog, nullptr, 0, nullptr);
+	// log any stall that occurs
+	if(g_Watchdog)
+		CreateThread(nullptr, 0, Watchdog, nullptr, 0, nullptr);
 
 	if (MH_Initialize() != MH_OK)
 	{
@@ -1366,6 +2014,22 @@ static void Init()
 		return;
 	}
 
+	{
+		HMODULE self = nullptr;
+		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			(LPCSTR)&UseHardcoded, &self) && self)
+		{
+			MODULEINFO smi;
+			if (GetModuleInformation(GetCurrentProcess(), self, &smi, sizeof smi))
+			{
+				g_selfBase = (uintptr_t)smi.lpBaseOfDll;
+				g_selfTop = g_selfBase + smi.SizeOfImage;
+				Dbg("[60] proxy base=%08X top=%08X (fault RVA = eip-base)\n",
+					(unsigned)g_selfBase, (unsigned)g_selfTop);
+			}
+		}
+	}
 	if (MH_CreateHook((void*)g.tick, (void*)&Hook_Tick, (void**)&oTick) != MH_OK) Dbg("[60] hook tick FAILED\n");
 	if (MH_CreateHook((void*)g.render, (void*)&Hook_Render, (void**)&oRender) != MH_OK) Dbg("[60] hook render FAILED\n");
 	if (MH_CreateHook((void*)g.logic, (void*)&Hook_Logic, (void**)&oLogic) != MH_OK) Dbg("[60] hook logic FAILED\n");
@@ -1373,28 +2037,29 @@ static void Init()
 	if (MH_CreateHook((void*)g.dtor, (void*)&Hook_Dtor, (void**)&oDtor) != MH_OK) Dbg("[60] hook dtor FAILED\n");
 	if (MH_CreateHook((void*)g.scene, (void*)&Hook_SceneDraw, (void**)&oSceneDraw) != MH_OK) Dbg("[60] hook scene FAILED\n");
 
+	if (g_tileListOptimization)
+	{
+		g_tiles.reserve(16384);
+		if (MH_CreateHook((void*)g.tileadd, (void*)&Hook_TileAddUnique, (void**)&oTileAdd) != MH_OK) Dbg("[60] hook tileadd FAILED\n");
+		if (MH_CreateHook((void*)0x4720E0, (void*)&Hook_TileDrain, (void**)&oTileDrain) != MH_OK) Dbg("[60] hook tiledrain FAILED\n");
+	}
+
 	if (g_unifyRes)
 	{
 		if (MH_CreateHook((void*)g.modegate, (void*)&Hook_ModeGate, (void**)&oModeGate) != MH_OK)
 			Dbg("[60] hook modegate FAILED\n");
 	}
-
 	if (g_childProfile || g_mapProfile)
 	{
 		if (MH_CreateHook((void*)g.maplayers, (void*)&Hook_MapLayers, (void**)&oMapLayers) != MH_OK) Dbg("[60] hook maplayers FAILED\n");
 	}
-	if (g_mapProfile)
-	{
-		if (MH_CreateHook((void*)g.tileadd, (void*)&Hook_TileAddUnique, (void**)&oTileAdd) != MH_OK) Dbg("[60] hook tileadd FAILED\n");
-	}
-
 	if (g_childProfile)
 	{
 		if (MH_CreateHook((void*)g.surf, (void*)&Hook_Surf, (void**)&oSurf) != MH_OK) Dbg("[60] hook surf FAILED\n");
 		if (MH_CreateHook((void*)g.spr2, (void*)&Hook_Spr2, (void**)&oSpr2) != MH_OK) Dbg("[60] hook spr2 FAILED\n");
 		if (MH_CreateHook((void*)g.ui, (void*)&Hook_Ui, (void**)&oUi) != MH_OK) Dbg("[60] hook ui FAILED\n");
 	}
-	
+
 	if (g_doArrows)
 	{
 		if (MH_CreateHook((void*)g.slots, (void*)&Hook_Slots, (void**)&oSlots) != MH_OK)
@@ -1405,6 +2070,23 @@ static void Init()
 		if (MH_CreateHook((void*)g.camcommit, (void*)&Hook_CamCommit, (void**)&oCamCommit) != MH_OK)
 			Dbg("[60] hook camcommit(zoom) FAILED\n");
 	}
+	if (g_bannerShrink || g_bannerDedup)   // banner fns needed by shrink OR dedup
+	{
+		if (MH_CreateHook((void*)g.areaBanner, (void*)&Hook_AreaBanner, (void**)&oAreaBanner) != MH_OK) Dbg("[60] hook areaBanner FAILED\n");
+		if (MH_CreateHook((void*)g.vehBanner, (void*)&Hook_VehBanner, (void**)&oVehBanner) != MH_OK) Dbg("[60] hook vehBanner FAILED\n");
+	}
+	if (g_bannerShrink)                    // shrink-only primitives
+	{
+		if (MH_CreateHook((void*)g.drawIcon, (void*)&Hook_DrawIcon, (void**)&oDrawIcon) != MH_OK) Dbg("[60] hook drawIcon FAILED\n");
+		if (MH_CreateHook((void*)g.drawSprite, (void*)&Hook_DrawSprite, (void**)&oDrawSprite) != MH_OK) Dbg("[60] hook drawSprite FAILED\n");
+		if (MH_CreateHook((void*)g.drawScaledStr, (void*)&Hook_DrawScaledStr, (void**)&oDrawScaledStr) != MH_OK) Dbg("[60] hook drawScaledStr FAILED\n");
+	}
+	if (g_bannerDedup)
+	{
+		if (MH_CreateHook((void*)g.levelStart, (void*)&Hook_LevelStart, (void**)&oLevelStart) != MH_OK) Dbg("[60] hook levelStart FAILED\n");
+
+		if (MH_CreateHook((void*)g.sessionTeardown, (void*)&Hook_SessionTeardown, (void**)&oSessionTeardown) != MH_OK) Dbg("[60] hook sessionTeardown FAILED\n");
+	}
 
 	if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK)
 		Dbg("[60] enable FAILED\n");
@@ -1412,6 +2094,7 @@ static void Init()
 
 	LogLaunchEnv();
 }
+
 BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID)
 {
 	if (r == DLL_PROCESS_ATTACH)
