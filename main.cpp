@@ -18,6 +18,9 @@
 #include <unordered_set>
 #include <tlhelp32.h>
 #include "MinHook.h"
+#include <ddraw.h>   // near the top with the other includes
+
+#include "gta2_ws_compat.h"
 
 #pragma comment(lib,"winmm.lib")
 #pragma comment(lib,"psapi.lib")
@@ -65,6 +68,8 @@ static uint32_t g_renderN = 0, g_pumpN = 0;
 static double   g_renderDurSum = 0; static DWORD g_renderDurMax = 0;
 static bool g_debugLogic = false;
 
+static int g_wsCompat = 1;   // ws_compat: 0 off / 1 auto / 2 force
+
 // ---- adaptive pump (present-cost-gated) ----
 static bool     g_adaptivePump = true;
 static double   g_debt = 0.0;            // DIAGNOSTIC only now (not a gate)
@@ -75,9 +80,9 @@ static double   g_lastPresentCPU = 16.0; // EMA of FULL present (Hook_Render inc
 static double   g_pumpBudgetMs = 42.0;   // legacy knob (no longer gates; kept for ini compat + logging)
 
 // ---- fix car/ped/object flicker on spawn ----
-static uint32_t g_spawnWarmup = 3;   // "spawn_warmup": ticks to suppress interp after first appearance
-static uint32_t g_spawnSkips = 0;
-static int32_t g_maxMove = 4 << 14;   // "maxmove" tiles: lerp deltas bigger than this snap (relocate/recycle), never swoop
+static uint32_t g_spawnObjSuppressRenderForTicks = 3;   // "spawn_object_rendertick_fix_warmup_tick_time": ticks to suppress interp after first appearance
+static uint32_t g_spawnObjSkips = 0;	// debug stuff?
+static int32_t g_maxObjMove = 4 << 14;   // "maxmove" tiles: lerp deltas bigger than this snap (relocate/recycle), never swoop
 
 // ---- map-layer / tile-dedup profiler (diagnostic; flag: mapprofile, DEFAULT OFF) ----
 static bool     g_mapProfile = false;
@@ -96,6 +101,9 @@ static std::unordered_map<int32_t*, ArrowState> g_arrow;
 typedef int(__fastcall* fn_slots_t)(void*, void*);
 static fn_slots_t oSlots = nullptr;
 
+//
+
+static bool g_bApply32bpp = true;
 
 
 
@@ -106,7 +114,7 @@ static fn_slots_t oSlots = nullptr;
 static bool g_tileListOptimization = true;   // ini "tilelist_opt"
 
 // ---- manual zoom: drive HEIGHT target [6]; engine propagates to [40]->[30..33]->[8..11] ----
-static bool     g_zoom = false;     // "zoom"
+static bool     g_zoom = true;     // "zoom"
 static int32_t  g_zoomOffset = 0;         // persistent user offset (Q14), additive on speed-zoom base
 static int32_t  g_zoomStep = 2048;      // "zoomstep"  per-tick while held (0.125/tick)
 static int32_t  g_zoomMax = 73728;     // "zoommax"   +5.0  -> total height ~6.0
@@ -115,6 +123,10 @@ static int      g_zoomKeys = 1;         // "zoomkeys"  0=numpad +/- , 1=main-row
 static const int32_t Z_ENGINE_MAX = 14 << 14;   // 229376, straight from Camera_ClampZoom (5E3D54)
 
 
+// HUD Fix
+
+static bool g_menuScale = true;                // menu_scale_fix
+static bool g_skipIntro = false;	// skip_intro
 
 // ---- HUD banner shrink (area-name + vehicle-name plaques) ----
 static bool    g_bannerShrink = false;   // ini "banner_shrink"
@@ -151,7 +163,10 @@ typedef void(__stdcall* fn_drawscaledstr_t)(int, int, int, int);
 static fn_drawicon_t      oDrawIcon = nullptr;
 static fn_drawsprite_t    oDrawSprite = nullptr;
 static fn_drawscaledstr_t oDrawScaledStr = nullptr;
+static int  g_resWidth = 0, g_resHeight = 0;   // res_width / res_height (0 = use registry)
 
+
+static bool g_audioWarmUp = true;
 
 /// BONUS CONTENT ^
 
@@ -200,6 +215,9 @@ static void UseHardcoded()
 	g.sessionTeardown = 0x462060;	// Session_Teardown: Game exit or entering back main menu
 }
 
+static BYTE* const g_pFrontendFlag = (BYTE*)0x595018;  // g_frontendActive: 1 while frontend/menu active
+
+static uintptr_t g_d3dBase = 0;
 
 // ---- logging ----------------------------------------------------------
 // ---- async logging: lock-free MPSC ring + dedicated flush thread -------------------
@@ -476,7 +494,169 @@ static void LogVideoMode()
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+//
 
+static void FrontendScale(float& s, int& ox, int& oy)
+{
+	int W = 640, H = 480;
+	__try {
+		uintptr_t surf = *(uintptr_t*)0x673D20;                 // g_surface
+		if (surf > 0x10000 && surf < 0x7FFFFFFF) {
+			int w = *(int*)(surf + 72), h = *(int*)(surf + 76);
+			if (w >= 320 && w <= 7680 && h >= 240 && h <= 4320) { W = w; H = h; }
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	float sx = (float)W / 640.0f, sy = (float)H / 480.0f;
+	s = sx < sy ? sx : sy;
+	ox = (int)llround((W - 640.0 * s) / 2.0);
+	oy = (int)llround((H - 480.0 * s) / 2.0);
+}
+// content: scale the 4 verts (x@+0, y@+4, stride 8 floats). frontend-only, in place (scratch).
+typedef void(__stdcall* fn_gbhquad_t)(int, int, int, int);
+static fn_gbhquad_t o_gbhDrawQuad = nullptr;
+static void __stdcall Hook_gbhDrawQuad(int a1, int a2, int a3, int a4)
+{
+	if (g_menuScale && *g_pFrontendFlag && a3) {
+		__try {
+			float s; int ox, oy; FrontendScale(s, ox, oy);
+			if (s != 1.0f || ox || oy) {
+				float* v = (float*)a3;
+				for (int i = 0; i < 4; i++) {
+					v[i * 8] = v[i * 8] * s + ox;
+					v[i * 8 + 1] = v[i * 8 + 1] * s + oy;
+				}
+				// Gbh_DrawQuad_Internal (0xE02CC0): with flag 0x10000 it rebuilds
+				// verts 1..3 from TEXTURE w/h (tex+14/+16) reading ONLY vert0.xy, so
+				// our scaled SIZE is discarded and only POSITION survives => glyphs
+				// land at scaled pen positions but draw at native size ("spaced + thin",
+				// city number drifts out of its circle). Clear 0x10000 so all 4 scaled
+				// verts are honoured; keep the 0x20000 the engine force-sets alongside
+				// it (texture-address render state) so addressing is unchanged.
+				if (a1 & 0x10000) a1 = (a1 | 0x20000) & ~0x10000;
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+	o_gbhDrawQuad(a1, a2, a3, a4);
+}
+// background: reimplement the Blt with a scaled (stretched) dest rect. frontend-only.
+typedef int8_t(__stdcall* fn_gbhblit_t)(int, int, int, int, int, int, int);
+static fn_gbhblit_t o_gbhBlitImage = nullptr;
+static int8_t __stdcall Hook_gbhBlitImage(int slot, int sl, int st, int sr, int sb, int dx, int dy)
+{
+	if (!g_menuScale || !*g_pFrontendFlag)
+		return o_gbhBlitImage(slot, sl, st, sr, sb, dx, dy);
+	__try {
+		int count = *(int*)(g_d3dBase + 0x13898);                 // dword_E13898
+		if (slot < 0 || slot >= count) return o_gbhBlitImage(slot, sl, st, sr, sb, dx, dy);
+		unsigned char* table = *(unsigned char**)(g_d3dBase + 0x13894);  // dword_E13894
+		if (!table) return o_gbhBlitImage(slot, sl, st, sr, sb, dx, dy);
+		unsigned char* e = table + 16 * slot;
+		if (!*(int*)e) return -1;
+		IDirectDrawSurface7* img = *(IDirectDrawSurface7**)(e + 12);
+		if (!img || img->IsLost() != DD_OK)                       // lost -> let original restore (returns -10)
+			return o_gbhBlitImage(slot, sl, st, sr, sb, dx, dy);
+		IDirectDrawSurface7* target = *(IDirectDrawSurface7**)(*(uintptr_t*)(g_d3dBase + 0x13DC8) + 312);
+		if (!target) return o_gbhBlitImage(slot, sl, st, sr, sb, dx, dy);
+		float s; int ox, oy; FrontendScale(s, ox, oy);
+		int rL = dx, rT = dy, rR = dx - sl + sr, rB = dy - st + sb;               // original's 1:1 dest
+		RECT dst = { (LONG)(llround(rL * s) + ox), (LONG)(llround(rT * s) + oy),
+					 (LONG)(llround(rR * s) + ox), (LONG)(llround(rB * s) + oy) };
+		RECT src = { sl, st, sr, sb };
+		HRESULT hr = target->Blt(&dst, img, &src, DDBLT_WAIT, nullptr);
+		if (hr == DD_OK) return 0;
+		return o_gbhBlitImage(slot, sl, st, sr, sb, dx, dy);            // blt failed -> fall back
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return o_gbhBlitImage(slot, sl, st, sr, sb, dx, dy);
+	}
+}
+//
+
+typedef int(__stdcall* fn_gbhloadimg_t)(unsigned char*);
+static fn_gbhloadimg_t o_gbhLoadImage = nullptr;
+static inline int Mask_Shift(DWORD m) { int s = 0; if (!m) return 0; while (!(m & 1)) { m >>= 1; ++s; } return s; }
+static inline int Mask_Size(DWORD m) { while (m && !(m & 1)) m >>= 1; int n = 0; while (m & 1) { m >>= 1; ++n; } return n; }
+static bool g_menuFmtLogged = false;
+static void FixMenuImage32(const unsigned char* a1, int slot)
+{
+	if (!g_d3dBase || slot < 0) return;
+	__try {
+		int count = *(int*)(g_d3dBase + 0x13898);                       // dword_E13898
+		if (slot >= count) return;
+		unsigned char* table = *(unsigned char**)(g_d3dBase + 0x13894); // dword_E13894 (ptr var)
+		if (!table) return;
+		IDirectDrawSurface7* surf = *(IDirectDrawSurface7**)(table + 16 * slot + 12);
+		if (!surf) return;
+		DDSURFACEDESC2 d; memset(&d, 0, sizeof d); d.dwSize = sizeof d;
+		if (FAILED(surf->Lock(nullptr, &d, DDLOCK_WAIT, nullptr))) return;
+		if (!g_menuFmtLogged) {
+			g_menuFmtLogged = true;
+			Dbg("[MENU32] slot=%d bpp=%u pitch=%d W=%u H=%u R=%08X G=%08X B=%08X\n",
+				slot, d.ddpfPixelFormat.dwRGBBitCount, (int)d.lPitch,
+				*(const uint16_t*)(a1 + 12), *(const uint16_t*)(a1 + 14),
+				d.ddpfPixelFormat.dwRBitMask, d.ddpfPixelFormat.dwGBitMask, d.ddpfPixelFormat.dwBBitMask);
+		}
+		if (d.ddpfPixelFormat.dwRGBBitCount == 32 && d.lpSurface) {
+			const int W = *(const uint16_t*)(a1 + 12);
+			const int H = *(const uint16_t*)(a1 + 14);
+			int rL = Mask_Shift(d.ddpfPixelFormat.dwRBitMask) + Mask_Size(d.ddpfPixelFormat.dwRBitMask) - 5;
+			int gL = Mask_Shift(d.ddpfPixelFormat.dwGBitMask) + Mask_Size(d.ddpfPixelFormat.dwGBitMask) - 5;
+			int bL = Mask_Shift(d.ddpfPixelFormat.dwBBitMask) + Mask_Size(d.ddpfPixelFormat.dwBBitMask) - 5;
+			if (rL < 0) rL = 0; if (gL < 0) gL = 0; if (bL < 0) bL = 0;
+			const unsigned char* src = a1 + a1[0] + 18;    // matches v9 = &a1[*a1 + 18]
+			unsigned char* base = (unsigned char*)d.lpSurface;
+			for (int y = 0; y < H; ++y) {
+				uint32_t* row = (uint32_t*)(base + (intptr_t)d.lPitch * (H - 1 - y)); // src top -> dst bottom
+				for (int x = 0; x < W; ++x) {
+					uint16_t w = (uint16_t)(src[0] | (src[1] << 8)); src += 2;
+					row[x] = (((uint32_t)(w & 0x1F)) << bL)    // src lo  -> B   (exact
+						| (((uint32_t)((w >> 5) & 0x1F)) << gL)    // src mid -> G    replica of
+						| (((uint32_t)((w >> 10) & 0x1F)) << rL);   // src hi  -> R    the original)
+				}
+			}
+		}
+		surf->Unlock(nullptr);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+static int __stdcall Hook_gbhLoadImage(unsigned char* a1)
+{
+	int slot = o_gbhLoadImage(a1);
+	if (slot >= 0 && g_bApply32bpp) FixMenuImage32(a1, slot);
+	return slot;
+}
+
+// Install lazily: Frontend_LoadMenuBgImages (0x452E20) runs at frontend-enter,
+// long after our Init() and after d3ddll is loaded -> no boot race.
+typedef void(__cdecl* fn_loadbg_t)();
+static fn_loadbg_t o_FrontendLoadMenuBgImages = nullptr;
+static void __cdecl Hook_FrontendLoadMenuBgImages()
+{
+	static bool once = false;
+	if (!once) {
+		once = true;
+		HMODULE h = GetModuleHandleA("d3ddll.dll");
+		if (h) {
+			g_d3dBase = (uintptr_t)h;
+			if (g_bApply32bpp) {
+				void* p = (void*)GetProcAddress(h, "gbh_LoadImage");
+				if (p && MH_CreateHook(p, (void*)&Hook_gbhLoadImage, (void**)&o_gbhLoadImage) == MH_OK) MH_EnableHook(p);
+				Dbg("[MENU32] LoadImage %s\n", o_gbhLoadImage ? "ok" : "FAIL");
+			}
+			if (g_menuScale) {
+				void* q = (void*)GetProcAddress(h, "gbh_DrawQuad");
+				if (q && MH_CreateHook(q, (void*)&Hook_gbhDrawQuad, (void**)&o_gbhDrawQuad) == MH_OK) MH_EnableHook(q);
+				void* b = (void*)GetProcAddress(h, "gbh_BlitImage");
+				if (b && MH_CreateHook(b, (void*)&Hook_gbhBlitImage, (void**)&o_gbhBlitImage) == MH_OK) MH_EnableHook(b);
+				Dbg("[MENU32] scale quad=%s blit=%s\n", o_gbhDrawQuad ? "ok" : "FAIL", o_gbhBlitImage ? "ok" : "FAIL");
+			}
+		}
+		else Dbg("[MENU32] d3ddll not loaded\n");
+	}
+	o_FrontendLoadMenuBgImages();
+}
 // -----------------------------------------------------------------------
 // Audio file-cache warmer
 // Fixes stutter caused by loading sounds during active gameplay (Especially on HDDs)
@@ -659,10 +839,16 @@ static fn_scene_t oSceneDraw = nullptr;
 
 void Crash_ReinstallSEHFilter();
 
+static double g_presentQPCema = 16.5, g_sceneQPCema = 13.5;
+
 static void __fastcall Hook_SceneDraw(void* thisp, void* edx)
 {
 	DWORD t = timeGetTime();
+	LARGE_INTEGER pa; QueryPerformanceCounter(&pa);
 	oSceneDraw(thisp, edx);
+	LARGE_INTEGER pb; QueryPerformanceCounter(&pb);
+	double pres = (double)(pb.QuadPart - pa.QuadPart) * 1000.0 / (double)g_qpf.QuadPart;
+	g_sceneQPCema = g_sceneQPCema * 0.9 + pres * 0.1;
 	Crash_ReinstallSEHFilter();   // Render_DrawScene tail just ran __CxxRestore... — re-arm NOW
 	DWORD d = timeGetTime() - t;
 	g_drawSum += d;
@@ -674,12 +860,19 @@ static void __fastcall Hook_SceneDraw(void* thisp, void* edx)
 
 	g_lastDrawCPU = g_lastDrawCPU * 0.6 + (double)d * 0.4;
 }
-
+static bool SessionIsPaused()
+{
+	__try {
+		uintptr_t s = *(uintptr_t*)g.pSession;
+		return s && *(int*)s == 2;          // *session==2 == paused 
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 typedef int(__fastcall* fn_camcommit_t)(void*, void*);
 static fn_camcommit_t oCamCommit = nullptr;
 static int __fastcall Hook_CamCommit(void* thisp, void* edx)
 {
-	if (g_zoom && g_zoomOffset)
+	if (g_zoom && g_zoomOffset && !SessionIsPaused())
 		__try {
 		int32_t* cam = (int32_t*)thisp;
 		int32_t z = cam[6] + g_zoomOffset;          // [6] = staged height target
@@ -747,6 +940,7 @@ static char __fastcall Hook_TileDrain(void* t, void* e)                        /
 {
 	for (size_t i = g_tiles.size(); i-- > 0; )        // engine draws newest -> oldest
 		Tile_DrawAt(t, e, &g_tiles[i].x, &g_tiles[i].y);
+	if (g_tiles.size() > g_dedupMax) g_dedupMax = (uint32_t)g_tiles.size();
 	g_tiles.clear();
 	if (++g_tileGen == 0) { memset(g_tileStamp, 0, sizeof g_tileStamp); g_tileGen = 1; }
 	return 0;
@@ -766,22 +960,27 @@ static bool g_doObjs = true;
 static bool g_doCamera = true;
 static bool g_forceDirty = true;
 
+static bool g_useDeadSet = true;
 static bool g_preDirty = true;   // force-dirty +72 BEFORE draw (fixes stale-cache ghost — doc §2)
 
 static double g_capFps = 60.0;
 
+//
+
+static bool    g_cullFollow = true;        // ini "cull_follow"
+static int32_t g_savedRect[4];
+static bool    g_savedRectValid = false;
+
 // -----------------------------------------------------------------------
 static bool g_camZ = true;         // "cameraz": also interpolate camera HEIGHT [40] (ramps/elevation)
-static bool g_unifyRes = false;    // "unifyres": menu resolves to config res => no menu<->game blink
-
-static BYTE* const g_pFrontendFlag = (BYTE*)0x595018;  // g_frontendActive: 1 while frontend/menu active
+static bool g_unifyRes = true;    // "unifyres": menu resolves to config res => no menu<->game blink
 
 static std::unordered_set<int32_t*> g_dead;
 
 static uint32_t g_dtorHits = 0;
 static uint32_t g_extraInterp = 0;
 
-static bool g_useDeadSet = true;
+
 typedef int(__fastcall* fn_dtor_t)(void*, void*);
 static fn_dtor_t oDtor = nullptr;
 
@@ -815,7 +1014,7 @@ static void LoadConfig()
 		int m = GetPrivateProfileIntA("60fps", "maxmove", 4, path);
 		if (m < 1)
 			m = 4;
-		g_maxMove = m << 14;
+		g_maxObjMove = m << 14;
 	}
 
 	g_doArrows = GetPrivateProfileIntA("60fps", "arrows", 1, path) != 0;
@@ -834,11 +1033,10 @@ static void LoadConfig()
 	g_tileListOptimization = GetPrivateProfileIntA("60fps", "tilelist_opt", 1, path) != 0;
 	
 
-	// audio
-	g_spawnWarmup = (uint32_t)GetPrivateProfileIntA("60fps", "spawn_warmup", 3, path);
-
-
+	g_spawnObjSuppressRenderForTicks = (uint32_t)GetPrivateProfileIntA("60fps", "spawn_object_rendertick_fix_warmup_tick_time", 3, path);
 	g_unifyRes = GetPrivateProfileIntA("60fps", "unifyres", 1, path) != 0;
+
+	g_audioWarmUp = GetPrivateProfileIntA("60fps", "audiocache_warmup", 1, path) != 0;
 
 	//
 	g_logEnabled = GetPrivateProfileIntA("60fps", "log", 1, path) != 0;
@@ -873,7 +1071,15 @@ static void LoadConfig()
 	if (g_bannerPct > 400)
 		g_bannerPct = 400;
 
+	g_bApply32bpp = GetPrivateProfileIntA("60fps", "32bit_mode", 1, path) != 0;
+	g_menuScale = GetPrivateProfileIntA("60fps", "menu_scale_fix", 1, path) != 0;
+	g_skipIntro = GetPrivateProfileIntA("60fps", "skip_intro", 0, path) != 0;
 
+	g_resWidth = GetPrivateProfileIntA("60fps", "res_width", 0, path);
+	g_resHeight = GetPrivateProfileIntA("60fps", "res_height", 0, path);
+	g_cullFollow = GetPrivateProfileIntA("60fps", "cull_follow", 1, path) != 0;
+
+	g_wsCompat = GetPrivateProfileIntA("60fps", "ws_compat", 1, path);
 }
 static void ForceDirtyNow(int32_t* d)
 {   // clear +72 on both caches NOW, before the draw
@@ -1408,15 +1614,18 @@ static void BannerDedupReset()
 }
 static char* __fastcall Hook_LevelStart(void* thisp, void* edx)
 {
-	Dbg("[Level] Level Start");
-	BannerDedupReset();
+	Dbg("[Level] Level Start\n");
+	if(g_bannerDedup || g_bannerDedupCar)
+		BannerDedupReset();
 	// Start after the level-start hook is entered so the warmer does not
 	// delay level initialization on the main thread.
-	StartAudioWarm();
+
+	if(g_audioWarmUp)
+		StartAudioWarm();
 	return oLevelStart(thisp, edx);
 }
 
-static char* Hook_SessionTeardown()
+static char* __cdecl Hook_SessionTeardown()
 {
 	Dbg("[Level] Level End/Game Quit?\n");
 	return oSessionTeardown();
@@ -1461,7 +1670,7 @@ static void __fastcall Hook_AreaBanner(void* thisp, void* edx)
 }
 static void __fastcall Hook_VehBanner(void* thisp, void* edx)
 {
-	if (g_bannerDedup && g_bannerDedupCar && BannerDedupCheck(g_dedupCar, thisp)) return;   // repeat -> skip
+	if (g_bannerDedupCar && BannerDedupCheck(g_dedupCar, thisp)) return;   // repeat -> skip
 	if (!g_bannerShrink) { oVehBanner(thisp, edx); return; }
 	int cy = 10;
 	__try { cy = ((int*)thisp)[18]; }
@@ -1703,9 +1912,12 @@ static char __cdecl Hook_Logic()
 		g_renderDurSum = 0;
 		g_renderDurMax = 0;
 		if (g_debugLogic)
+		{
 			Dbg("[PERF2] drawCPU avg=%.2f max=%u (n=%u) drawEMA=%.1f presentEMA=%.1f | pumpBudget=%.0f debt=%.0f skips=%u | mode673E2C=%d fskip673598=%d\n",
 				g_drawN ? g_drawSum / g_drawN : 0.0, g_drawMax, g_drawN, g_lastDrawCPU, g_lastPresentCPU, g_pumpBudgetMs, g_debt, g_pumpSkips,
 				*(int*)0x673E2C, *(BYTE*)0x673598);	// 0x673E2C = g_bMultiplayer, 0x673598 = g_frameSkipEnable
+			Dbg("[PERF4] g_presentQPCema=%.3f g_sceneQPCema=%.3f diff=%.3f\n", g_presentQPCema, g_sceneQPCema, g_presentQPCema - g_sceneQPCema);
+		}
 		g_drawSum = 0;
 		g_drawMax = 0;
 		g_drawN = 0;
@@ -1773,6 +1985,19 @@ static char __cdecl Hook_Render()
 				g_camPtr[38 + i] = p + (int32_t)llround((double)(c - p) * a);
 			}
 		}
+		g_savedRectValid = false;
+
+		// to-do check whether cull follow is working or whether it does harm
+		if (g_cullFollow) __try {
+			int32_t dx = g_camPtr[38] - g_savedXY[0];   // interp - committed (0 if teleport-skipped)
+			int32_t dy = g_camPtr[39] - g_savedXY[1];
+			g_savedRect[0] = g_camPtr[30]; g_savedRect[1] = g_camPtr[31];
+			g_savedRect[2] = g_camPtr[32]; g_savedRect[3] = g_camPtr[33];
+			g_camPtr[30] += dx; g_camPtr[31] += dx;         // x0/x1
+			g_camPtr[32] += dy; g_camPtr[33] += dy;         // y0/y1
+			g_savedRectValid = true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { g_savedRectValid = false; }
 	}
 	CP(21);
 	g_savedObj.clear();
@@ -1846,7 +2071,7 @@ static char __cdecl Hook_Render()
 			int64_t dyv = llabs((int64_t)s.cy - s.py);
 			if (dxv > TELE || dyv > TELE)
 				continue;                                    // warp / level jump
-			if (dxv > g_maxMove || dyv > g_maxMove)          // relocate / recycled slot: snap, never swoop
+			if (dxv > g_maxObjMove || dyv > g_maxObjMove)          // relocate / recycled slot: snap, never swoop
 			{
 				if (g_debugLogic)
 					Dbg("[SNAP] d=%p age=%u k=%d dx=%.1f dy=%.1f (tiles) px=(%d,%d) cx=(%d,%d) cam=(%d,%d)\n",
@@ -1854,9 +2079,9 @@ static char __cdecl Hook_Render()
 						dxv / 16384.0, dyv / 16384.0, s.px, s.py, s.cx, s.cy, g_savedXY[0], g_savedXY[1]);
 				continue;
 			}
-			if ((uint32_t)(g_tick - s.bornTick) < g_spawnWarmup)   // fresh spawn settle (dtor'd slots)
+			if ((uint32_t)(g_tick - s.bornTick) < g_spawnObjSuppressRenderForTicks)   // fresh spawn settle (dtor'd slots)
 			{
-				++g_spawnSkips;
+				++g_spawnObjSkips;
 				continue;
 			}
 			int32_t lx = s.px + (int32_t)llround((double)(s.cx - s.px) * a);
@@ -1895,7 +2120,11 @@ static char __cdecl Hook_Render()
 
 	CP(24);
 	CP(25);
+	LARGE_INTEGER pa; QueryPerformanceCounter(&pa);
 	char r = oRender();
+	LARGE_INTEGER pb; QueryPerformanceCounter(&pb);
+	double pres = (double)(pb.QuadPart - pa.QuadPart) * 1000.0 / (double)g_qpf.QuadPart;
+	g_presentQPCema = g_presentQPCema * 0.9 + pres * 0.1;
 	CP(26);
 
 	for (auto& s : g_savedObj)
@@ -1907,6 +2136,10 @@ static char __cdecl Hook_Render()
 		g_camPtr[39] = g_savedXY[1];
 		if (g_camZ)
 			g_camPtr[40] = g_savedXY[2];
+		if (g_savedRectValid) {
+			g_camPtr[30] = g_savedRect[0]; g_camPtr[31] = g_savedRect[1];
+			g_camPtr[32] = g_savedRect[2]; g_camPtr[33] = g_savedRect[3];
+		}
 	}
 	CP(27);
 	g_inRender = false;
@@ -1960,10 +2193,58 @@ static char __cdecl Hook_Tick()
 	CP(3);
 	return r;
 }
+
+// Force 32bpp fullscreen: Vid_SetFullscreen's two `push 10h` -> `push 20h`
+static void Patch32bppMode() {
+	// Vid_SetFullscreen (0x4CB570): two REAL bpp args to Vid_CheckMode.
+	//   push 10h @ 0x4CB583  (operand byte @ +1 = 0x4CB584) -> primary mode check
+	//   push 10h @ 0x4CB5A5  (operand byte @ +1 = 0x4CB5A6) -> 640x480 fallback
+	// A 3rd push 10h @ 0x4CB5DC is only the bpp *reported* in Game_Assert's
+	// varargs — cosmetic, DO NOT touch.
+	const uintptr_t sites[2] = { 0x4CB584, 0x4CB5A6 };
+	int done = 0;
+	for (uintptr_t p : sites) {
+		uint8_t* b = (uint8_t*)p;
+		if (b[-1] != 0x6A || b[0] != 0x10) {            // confirm it's 'push 10h'
+			Dbg("[32BIT] %08X not push 10h (got %02X %02X) SKIP\n", (unsigned)p, b[-1], b[0]);
+			continue;
+		}
+		DWORD o; VirtualProtect(b, 1, PAGE_EXECUTE_READWRITE, &o);
+		*b = 0x20;
+		VirtualProtect(b, 1, o, &o);
+		++done;
+		Dbg("[32BIT] patched %08X -> push 20h\n", (unsigned)p);
+	}
+	Dbg("[32BIT] %d/2 patched%s\n", done, done == 2 ? "" : "  *** INCOMPLETE — half-16/half-32! ***");
+}
+
+
+typedef int(__stdcall* fn_reggetint_t)(const char*, int);
+static fn_reggetint_t oRegGetInt = nullptr;
+static int __stdcall Hook_RegGetInt(const char* name, int def)
+{
+	if (name) {
+		if (g_resWidth > 0 && g_resHeight > 0) {
+			if (!_stricmp(name, "full_width") || !_stricmp(name, "window_width"))  return g_resWidth;
+			if (!_stricmp(name, "full_height") || !_stricmp(name, "window_height")) return g_resHeight;
+		}
+		if (g_skipIntro && !_stricmp(name, "do_play_movie")) return 0;  // WinMain: !=1 => v12=0 => straight to menu
+	}
+	return oRegGetInt(name, def);
+}
 static void Init()
 {
 	LoadConfig();                       // read ini FIRST (sets g_logEnabled, ...)
 	if (g_logEnabled) { LogOpen(); LogInitRing(); }
+
+	{
+		ModFlags mf{ &g_bApply32bpp, &g_menuScale, &g_skipIntro, &g_unifyRes, &g_zoom,
+					 &g_doCamera, &g_childProfile, &g_mapProfile, &g_resWidth, &g_resHeight };
+		Compat_Run(mf, g_wsCompat);
+	}
+
+	if(g_bApply32bpp)
+		Patch32bppMode();
 
 	AddVectoredExceptionHandler(1, Veh);
 	SetUnhandledExceptionFilter(Uef);
@@ -2030,6 +2311,14 @@ static void Init()
 			}
 		}
 	}
+	if (g_bApply32bpp || g_menuScale) {
+		if (MH_CreateHook((void*)0x452E20, (void*)&Hook_FrontendLoadMenuBgImages,
+			(void**)&o_FrontendLoadMenuBgImages) != MH_OK)
+			Dbg("[60] hook FrontendLoadMenuBgImages FAILED\n");
+	}
+	if (g_skipIntro || (g_resWidth > 0 && g_resHeight > 0))
+		if (MH_CreateHook((void*)0x4B5660, (void*)&Hook_RegGetInt, (void**)&oRegGetInt) != MH_OK)
+			Dbg("[60] hook Registry_GetInt FAILED\n");
 	if (MH_CreateHook((void*)g.tick, (void*)&Hook_Tick, (void**)&oTick) != MH_OK) Dbg("[60] hook tick FAILED\n");
 	if (MH_CreateHook((void*)g.render, (void*)&Hook_Render, (void**)&oRender) != MH_OK) Dbg("[60] hook render FAILED\n");
 	if (MH_CreateHook((void*)g.logic, (void*)&Hook_Logic, (void**)&oLogic) != MH_OK) Dbg("[60] hook logic FAILED\n");
@@ -2070,7 +2359,7 @@ static void Init()
 		if (MH_CreateHook((void*)g.camcommit, (void*)&Hook_CamCommit, (void**)&oCamCommit) != MH_OK)
 			Dbg("[60] hook camcommit(zoom) FAILED\n");
 	}
-	if (g_bannerShrink || g_bannerDedup)   // banner fns needed by shrink OR dedup
+	if (g_bannerShrink || g_bannerDedup || g_bannerDedupCar)   // banner fns needed by shrink OR dedup
 	{
 		if (MH_CreateHook((void*)g.areaBanner, (void*)&Hook_AreaBanner, (void**)&oAreaBanner) != MH_OK) Dbg("[60] hook areaBanner FAILED\n");
 		if (MH_CreateHook((void*)g.vehBanner, (void*)&Hook_VehBanner, (void**)&oVehBanner) != MH_OK) Dbg("[60] hook vehBanner FAILED\n");
@@ -2081,12 +2370,11 @@ static void Init()
 		if (MH_CreateHook((void*)g.drawSprite, (void*)&Hook_DrawSprite, (void**)&oDrawSprite) != MH_OK) Dbg("[60] hook drawSprite FAILED\n");
 		if (MH_CreateHook((void*)g.drawScaledStr, (void*)&Hook_DrawScaledStr, (void**)&oDrawScaledStr) != MH_OK) Dbg("[60] hook drawScaledStr FAILED\n");
 	}
-	if (g_bannerDedup)
-	{
-		if (MH_CreateHook((void*)g.levelStart, (void*)&Hook_LevelStart, (void**)&oLevelStart) != MH_OK) Dbg("[60] hook levelStart FAILED\n");
+	
+	if (MH_CreateHook((void*)g.levelStart, (void*)&Hook_LevelStart, (void**)&oLevelStart) != MH_OK) Dbg("[60] hook levelStart FAILED\n");
 
-		if (MH_CreateHook((void*)g.sessionTeardown, (void*)&Hook_SessionTeardown, (void**)&oSessionTeardown) != MH_OK) Dbg("[60] hook sessionTeardown FAILED\n");
-	}
+
+	if (MH_CreateHook((void*)g.sessionTeardown, (void*)&Hook_SessionTeardown, (void**)&oSessionTeardown) != MH_OK) Dbg("[60] hook sessionTeardown FAILED\n");
 
 	if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK)
 		Dbg("[60] enable FAILED\n");

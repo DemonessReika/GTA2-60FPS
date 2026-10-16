@@ -7,6 +7,15 @@ Compatible GTA2 version:
 - Untested on newer versions.
 # Changelog
 
+## v1.03
+- Added automatic compatibility with "GTA 2 - Widescreen Fix" (untested but should be good to go).
+- Added enabled-by-default 32-bit rendering mode instead of regular 16-bit (ini toggle 32bit_mode), should reduce risk of performance issues from 16-to-32 compatibility layer that Windows OS does.
+- Fixed main menu being scaled down on resolutions larger than 640x480.
+- Skipping intro is now togglable using .ini variable.
+- Pedestrian/car spawning logic is now properly taking into account the zoom-out/zoom-in.
+- Fixed rare glitch where ped/car can spawn and disappear shortly after due to recycler at camera boundary edges.
+- Bunch of other GTA 2 performance fixes.
+
 ## v1.02
 - Added experimental fix to GTA2's stutter/lag whenever a new sound is played (such as weapon pick-up sound or radio station music).
 - Added optional .ini settings to only display banners "name of town area" and "name of car" once per gameplay (resets on playing new game or reloading save).
