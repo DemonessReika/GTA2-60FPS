@@ -7,6 +7,9 @@ Compatible GTA2 version:
 - Untested on newer versions.
 # Changelog
 
+## v1.03.1 
+- Disabled Auto-Compatibility with widescreen fix, feature broken currently. It might work with widescreen fix assuming you manually tinker with .ini properties.
+
 ## v1.03
 - Added automatic compatibility with "GTA 2 - Widescreen Fix" (untested but should be good to go).
 - Added enabled-by-default 32-bit rendering mode instead of regular 16-bit (ini toggle 32bit_mode), should reduce risk of performance issues from 16-to-32 compatibility layer that Windows OS does.
@@ -44,6 +47,8 @@ Compatible GTA2 version:
 4. Launch the game.
 
 That's it! 🖤
+
+Also, It's recommended to update .ini file too if you updated from older version to newer one of GTA 2 60 FPS!
 
 ## Configuration
 You may adjust things in ini file.

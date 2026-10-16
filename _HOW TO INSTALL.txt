@@ -1,14 +1,16 @@
 1. Copy C:\Windows\SysWOW64\ddraw.dll file to your desktop
 2. Rename copied ddraw.dll to real_ddraw.dll
 3. Drop real_ddraw.dll to GTA2 installation folder.
-4. Now finally drop the contents of GTA2_60FPS_v1_03_RELEASE zip file into GTA2 installation folder.
+4. Now finally drop the contents of GTA2_60FPS_v1_03_1_RELEASE zip file into GTA2 installation folder.
 
 How your GTA 2 folder should look like afterwards:
 ```
 gta2.exe
 gta2_60fps.ini
 real_ddraw.dll [ the renamed SysWOW64 ddraw.dll ]
-ddraw.dll [the modded one from GTA2_60FPS_v1_03_RELEASE.zip]
+ddraw.dll [the modded one from GTA2_60FPS_v1_03_1_RELEASE.zip]
 ```
 5. Adjust settings to your liking in gta2_60fps.ini
 6. Launch game and enjoy!
+---
+It's recommended to update .ini file too if you updated from older version to newer one of GTA 2 60 FPS!

@@ -2237,11 +2237,12 @@ static void Init()
 	LoadConfig();                       // read ini FIRST (sets g_logEnabled, ...)
 	if (g_logEnabled) { LogOpen(); LogInitRing(); }
 
-	{
-		ModFlags mf{ &g_bApply32bpp, &g_menuScale, &g_skipIntro, &g_unifyRes, &g_zoom,
-					 &g_doCamera, &g_childProfile, &g_mapProfile, &g_resWidth, &g_resHeight };
-		Compat_Run(mf, g_wsCompat);
-	}
+// broken currently
+//	{
+//		ModFlags mf{ &g_bApply32bpp, &g_menuScale, &g_skipIntro, &g_unifyRes, &g_zoom,
+//					 &g_doCamera, &g_childProfile, &g_mapProfile, &g_resWidth, &g_resHeight };
+//		Compat_Run(mf, g_wsCompat);
+//	}
 
 	if(g_bApply32bpp)
 		Patch32bppMode();
