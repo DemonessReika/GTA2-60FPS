@@ -18,7 +18,15 @@
 #include <unordered_set>
 #include <tlhelp32.h>
 #include "MinHook.h"
-#include <ddraw.h>   // near the top with the other includes
+#include <ddraw.h>
+
+#include <d3d11.h>
+#include <dxgi1_3.h>
+#include <dcomp.h>
+#pragma comment(lib,"d3d11.lib")
+#pragma comment(lib,"dxgi.lib")
+#pragma comment(lib,"dcomp.lib")
+
 
 #include "gta2_ws_compat.h"
 
@@ -105,18 +113,12 @@ static fn_slots_t oSlots = nullptr;
 
 static bool g_bApply32bpp = true;
 
-
-
-/// BONUS CONTENT 
-
-
-
 static bool g_tileListOptimization = true;   // ini "tilelist_opt"
 
 // ---- manual zoom: drive HEIGHT target [6]; engine propagates to [40]->[30..33]->[8..11] ----
 static bool     g_zoom = true;     // "zoom"
 static int32_t  g_zoomOffset = 0;         // persistent user offset (Q14), additive on speed-zoom base
-static int32_t  g_zoomStep = 2048;      // "zoomstep"  per-tick while held (0.125/tick)
+static int32_t  g_zoomStep = 2048;      // "zoom_step"  per-tick while held (0.125/tick)
 static int32_t  g_zoomMax = 73728;     // "zoommax"   +5.0  -> total height ~6.0
 static int32_t  g_zoomMin = 0;         // "zoommin"   0 = never dip below speed-zoom baseline
 static int      g_zoomKeys = 1;         // "zoomkeys"  0=numpad +/- , 1=main-row -/=
@@ -154,6 +156,7 @@ typedef char* (__cdecl* fn_sessionteardown_t)();
 static fn_levelstart_t oLevelStart = nullptr;
 static fn_sessionteardown_t oSessionTeardown = nullptr;
 
+static int g_flipLatency = 2;   // ini "flip_latency": 1 = min latency (stutters), 2 = smooth
 
 typedef void(__fastcall* fn_banner_t)(void*, void*);
 static fn_banner_t oAreaBanner = nullptr, oVehBanner = nullptr;
@@ -167,6 +170,11 @@ static int  g_resWidth = 0, g_resHeight = 0;   // res_width / res_height (0 = us
 
 
 static bool g_audioWarmUp = true;
+
+static bool g_flipPresent = true;
+static bool g_flipVsync = true;
+static bool g_flipSuppressEngine = true;   // "flip_suppress_engine": stub engine flip -> single presenter (the tear fix)
+static bool g_flipLog = false;
 
 /// BONUS CONTENT ^
 
@@ -182,7 +190,6 @@ struct {
 		areaBanner, vehBanner, drawIcon, drawSprite, drawScaledStr,
 		levelStart, sessionTeardown;
 } g;
-
 
 static void UseHardcoded()
 {
@@ -494,6 +501,77 @@ static void LogVideoMode()
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+
+
+
+//
+
+static bool g_collectibleCounter = false;   // ini "collectible_counter"
+static bool g_collectibleShowTotal = false;   // ini "collectible_show_total" (1="X OF Y", 0="X")
+static int  g_collectibleMsgTicks = 90;     // ini "collectible_msg_ticks" (HUD timer, 1..255)
+
+static const uintptr_t g_pFxMgr = 0x665788;          // g_fxMgr (pointer var) CONFIRMED
+static uintptr_t       g_pHud = 0x672F40;        // <<< g_hud (pointer var) — NEED THIS
+typedef char(__fastcall* fn_trycollect_t)(void*, void*, int);
+static fn_trycollect_t oTryCollect = nullptr;
+typedef char(__fastcall* fn_islocal_t)(void*, void*);
+typedef void(__fastcall* fn_layout1_t)(void*, void*);
+static const fn_islocal_t Player_IsLocal_fn = (fn_islocal_t)0x41DC70;
+static const fn_layout1_t Hud_LayoutCenteredText1_fn = (fn_layout1_t)0x4C69D0;
+static void ShowCollectibleMessage()
+{
+	__try {
+		uintptr_t fx = *(uintptr_t*)g_pFxMgr;
+		if (fx < 0x10000 || fx > 0x7FFFFFFF) return;
+		int total = *(int*)(fx + 84);
+		if (total < 0) total = 0; if (total > 50) total = 50;
+		int remaining = 0;
+		for (int i = 0; i < total; i++)
+			if (*(uint8_t*)(fx + 32 + i)) remaining++;        // ONLY [0..total-1]
+		int collected = total - remaining;
+		if (!g_pHud) return;
+		uintptr_t hud = *(uintptr_t*)g_pHud;
+		if (hud < 0x10000 || hud > 0x7FFFFFFF) return;
+		uint8_t* slot = (uint8_t*)(hud + 10168);              // CenteredText1
+		wchar_t text[64];
+		if (g_collectibleShowTotal)
+		{
+			_snwprintf(text, 63, L"%d OF %d TOKENS COLLECTED", collected, total);
+		}
+		else
+		{
+			if (collected > 1)
+				_snwprintf(text, 63, L"%d TOKENS COLLECTED", collected);
+			else
+				_snwprintf(text, 63, L"%d TOKEN COLLECTED", collected);
+		}
+		text[63] = 0;
+		int t = g_collectibleMsgTicks; if (t < 1) t = 1; if (t > 255) t = 255;
+		slot[0] = (uint8_t)t;                                 // display timer (counts down)
+		lstrcpynW((wchar_t*)(slot + 2), text, 60);            // string at +2
+		Hud_LayoutCenteredText1_fn(slot, nullptr);            // centered width -> +132
+		if (g_debugLogic) Dbg("[COLLECT] %d/%d (remain=%u)\n", collected, total, remaining);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+static char __fastcall Hook_TryCollectPickup(void* thisp, void* edx, int a2)
+{
+	int type = 0;
+	if (g_collectibleCounter)
+		__try { type = *(int*)((char*)a2 + 24); }
+	__except (EXCEPTION_EXECUTE_HANDLER) { type = 0; }
+	char r = oTryCollect(thisp, edx, a2);                     // let the game collect it first
+	if (g_collectibleCounter && r && type == 266) {           // collectible, successfully grabbed
+		__try {
+			void* player = *(void**)((char*)thisp + 348);     // ped+348 = owning Player*
+			if (player && Player_IsLocal_fn(player, nullptr)) // mirror the game's local-only rule
+				ShowCollectibleMessage();
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+	return r;
+}
+
 //
 
 static void FrontendScale(float& s, int& ox, int& oy)
@@ -627,7 +705,40 @@ static int __stdcall Hook_gbhLoadImage(unsigned char* a1)
 	if (slot >= 0 && g_bApply32bpp) FixMenuImage32(a1, slot);
 	return slot;
 }
+// ===== surf claw-back (§33) — drop the redundant pre-draw backbuffer lock =====
+static bool g_surfClawback = true;          // ini "surf_clawback"
+static uintptr_t g_pE43E18 = 0;             // d3ddll dword_E43E18 (RVA 0x43E18) — EndScene re-lock flag
+typedef int(__stdcall* fn_begin_t)();
+static fn_begin_t oBeginScene = nullptr;
 
+static void Patch_SurfClawback()
+{
+	uint8_t* p = (uint8_t*)0x4CAEC0;
+	Dbg("[SURF] prologue %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+		p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10]);
+	if (p[0] == 0xE9) { Dbg("[SURF] 4CAEC0 still trampolined (childprofile surf hook?) — set childprofile=0 or keep the surf-skip. ABORT\n"); return; }
+	// EXPECT: 05:83 EC 08 (sub esp,8 KEEP) | 08:50 (push eax) | 09:FF 15 (call Vid_GetSurface)
+	if (p[5] != 0x83 || p[6] != 0xEC || p[8] != 0x50 || p[9] != 0xFF || p[10] != 0x15) {
+		Dbg("[SURF] prologue mismatch — ABORT (send me the dump line)\n"); return;
+	}
+	DWORD o; VirtualProtect(p + 8, 7, PAGE_EXECUTE_READWRITE, &o);
+	memset(p + 8, 0x90, 7);        // push eax + call Vid_GetSurface -> 7 NOPs; sub esp,8 preserved
+	VirtualProtect(p + 8, 7, o, &o);
+	Dbg("[SURF] LOCK#1 removed: 7 NOPs @4CAEC8 (push+call Vid_GetSurface); sub esp,8 kept\n");
+}
+// (2) Force the re-lock flag so gbh_EndScene STILL locks → grab's +80 stays valid.
+static int __stdcall Hook_BeginScene()
+{
+	int r = oBeginScene();
+	if (g_surfClawback && g_pE43E18) *(volatile int*)g_pE43E18 = 1;  // force LOCK#2 so grab's +80 stays valid
+	return r;
+}
+
+static const int FL_STAGING_COUNT = 3;                              // max ring depth (compile-time array)
+static ID3D11Texture2D* s_flStaging[FL_STAGING_COUNT] = { nullptr, nullptr, nullptr };
+static int g_flStageRingN = 3;        // ini "flip_staging_ring" 1..3 (1 = old single-buffer behaviour)
+static int s_flStageRing = 0;         // ring cursor, advances per present
+static int s_flStageCur = 0;         // buffer grabbed this frame (consumed by present)
 // Install lazily: Frontend_LoadMenuBgImages (0x452E20) runs at frontend-enter,
 // long after our Init() and after d3ddll is loaded -> no boot race.
 typedef void(__cdecl* fn_loadbg_t)();
@@ -802,6 +913,10 @@ static DWORD WINAPI WarmAudioThread(LPVOID)
 	InterlockedExchange(&g_audioWarmFinished, 1);
 	return 0;
 }
+static double g_lastSceneMs = 0, g_lastGrabMs = 0, g_lastWaitMs = 0, g_lastPresentMs = 0;
+// steady-state flip EMAs: raw per-frame g_last* only ever surface in [DROP] (which never fires at 60),
+// so these are the ONLY way to see grab/present cost during a healthy run. Reported in the [FLIP] heartbeat.
+static double g_grabMsEma = 0.0, g_presentMsEma = 0.0, g_waitMsEma = 0.0, g_grabMsMax = 0.0;
 static void StartAudioWarm()
 {
 	// Only start one worker per process. The Windows cache survives level
@@ -840,14 +955,32 @@ static fn_scene_t oSceneDraw = nullptr;
 void Crash_ReinstallSEHFilter();
 
 static double g_presentQPCema = 16.5, g_sceneQPCema = 13.5;
+static bool    g_nextVblankAlpha = true;   // ini "nextvblank_alpha" (default ON)
+static double  g_refreshMs = 16.667;        // EMA of flip->flip interval (~one display refresh)
+static int64_t g_lastVblankQpc = 0;
+static bool    g_haveVblank = false;
+static double  g_lastPA = -1.0; static bool g_havePA = false;
+static int32_t g_lastPCamX = 0, g_lastPCamY = 0;
+static double  g_dASum = 0, g_dASumSq = 0, g_dAMin = 1e9, g_dAMax = -1e9; static uint32_t g_dAN = 0;
+static double  g_csSum = 0, g_csSumSq = 0; static uint32_t g_csN = 0;
+static double  g_latSum = 0, g_latSumSq = 0, g_latMin = 1e18, g_latMax = 0; static uint32_t g_latN = 0;
+//
+static double g_fSurfMs = 0, g_fMapMs = 0, g_fSpr2Ms = 0, g_fUiMs = 0; // per-FRAME child split
 
 static void __fastcall Hook_SceneDraw(void* thisp, void* edx)
 {
 	DWORD t = timeGetTime();
+	int64_t s0 = g_qcSurf, m0 = g_qcMap, p0 = g_qcSpr2, u0 = g_qcUi;       
 	LARGE_INTEGER pa; QueryPerformanceCounter(&pa);
 	oSceneDraw(thisp, edx);
 	LARGE_INTEGER pb; QueryPerformanceCounter(&pb);
+	double invms = g_qpf.QuadPart ? 1000.0 / (double)g_qpf.QuadPart : 0.0;  
+	g_fSurfMs = (double)(g_qcSurf - s0) * invms;                            
+	g_fMapMs = (double)(g_qcMap - m0) * invms;                            
+	g_fSpr2Ms = (double)(g_qcSpr2 - p0) * invms;                            
+	g_fUiMs = (double)(g_qcUi - u0) * invms;                            
 	double pres = (double)(pb.QuadPart - pa.QuadPart) * 1000.0 / (double)g_qpf.QuadPart;
+	g_lastSceneMs = pres;   // the QPC 'pres' you already compute
 	g_sceneQPCema = g_sceneQPCema * 0.9 + pres * 0.1;
 	Crash_ReinstallSEHFilter();   // Render_DrawScene tail just ran __CxxRestore... — re-arm NOW
 	DWORD d = timeGetTime() - t;
@@ -986,6 +1119,12 @@ static fn_dtor_t oDtor = nullptr;
 
 
 static bool g_Watchdog = false;
+// ---- camera velocity-Hermite 
+static bool     g_camHermite = true;          // ini "cam_smooth_hermite"
+static int      g_camHermiteStrength = 100;   // ini "cam_smooth_hermite_strength" (0..100)
+static int32_t  g_camChord[3] = { 0,0,0 };    // this tick's chord (cur-prev)
+static int32_t  g_camPrevVel[3] = { 0,0,0 };    // last tick's chord = velocity entering this keyframe
+static uint32_t g_camVelTick = 0xFFFFFFFFu;
 
 static void LoadConfig()
 {
@@ -1080,6 +1219,28 @@ static void LoadConfig()
 	g_cullFollow = GetPrivateProfileIntA("60fps", "cull_follow", 1, path) != 0;
 
 	g_wsCompat = GetPrivateProfileIntA("60fps", "ws_compat", 1, path);
+
+	g_nextVblankAlpha = GetPrivateProfileIntA("60fps", "nextvblank_alpha", 1, path) != 0;
+	g_flipPresent = GetPrivateProfileIntA("60fps", "flip_present", 1, path) != 0;
+	g_flipLog = GetPrivateProfileIntA("60fps", "flip_log", 0, path) != 0;
+	g_flipVsync = GetPrivateProfileIntA("60fps", "flip_vsync", 1, path) != 0;
+	g_flipSuppressEngine = GetPrivateProfileIntA("60fps", "flip_suppress_engine", 1, path) != 0;
+
+	g_flipLatency = GetPrivateProfileIntA("60fps", "flip_latency", 2, path);
+	if (g_flipLatency < 1) g_flipLatency = 1;
+	if (g_flipLatency > 3) g_flipLatency = 3;
+	g_surfClawback = GetPrivateProfileIntA("60fps", "surf_clawback", 1, path) != 0;
+	g_flStageRingN = GetPrivateProfileIntA("60fps", "flip_staging_ring", 3, path);
+	if (g_flStageRingN < 1) g_flStageRingN = 1;
+	if (g_flStageRingN > FL_STAGING_COUNT) g_flStageRingN = FL_STAGING_COUNT;
+
+	g_camHermite = GetPrivateProfileIntA("60fps", "cam_smooth_hermite", 1, path) != 0;
+	g_camHermiteStrength = GetPrivateProfileIntA("60fps", "cam_smooth_hermite_strength", 100, path);
+
+	g_collectibleCounter = GetPrivateProfileIntA("60fps", "collectible_counter", 0, path) != 0;
+	g_collectibleShowTotal = GetPrivateProfileIntA("60fps", "collectible_show_total", 0, path) != 0;
+	g_collectibleMsgTicks = GetPrivateProfileIntA("60fps", "collectible_msg_ticks", 90, path);
+
 }
 static void ForceDirtyNow(int32_t* d)
 {   // clear +72 on both caches NOW, before the draw
@@ -1090,6 +1251,8 @@ static void ForceDirtyNow(int32_t* d)
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+
+static double g_frametimeEMA = 33.333;   // smoothed tick period feeding Alpha()
 
 static DWORD  g_prevDue = 0;
 static DWORD g_frametime = 33;
@@ -1561,6 +1724,10 @@ static DWORD WINAPI Watchdog(LPVOID)
 		}
 	}
 }
+
+
+
+
 static int32_t* CameraPhys()
 {
 	uintptr_t s = *(uintptr_t*)g.pSession;
@@ -1572,6 +1739,333 @@ static int32_t* CameraPhys()
 		return nullptr;
 	return (int32_t*)(e + 332);
 }
+
+/// expereiment
+
+static ID3D11Device* s_flDev = nullptr;
+static ID3D11DeviceContext* s_flCtx = nullptr;
+static IDXGISwapChain1* s_flSwap = nullptr;
+static IDCompositionDevice* s_flDcDev = nullptr;
+static IDCompositionTarget* s_flDcTgt = nullptr;
+static IDCompositionVisual* s_flDcVis = nullptr;
+
+
+
+static HANDLE s_flWaitable = nullptr;
+static int   s_flW = 0, s_flH = 0;
+static bool  s_flReady = false, s_flGrabbed = false, s_flShown = false;
+static volatile LONG s_flDead = 0;
+static uint32_t s_flGrabs = 0, s_flPresents = 0;
+typedef void(__cdecl* fn_cxx_t)();
+static fn_cxx_t oCxxRestore = nullptr;
+// Per-row copy DD-surface -> mapped staging. Non-temporal stores: the CPU never reads this buffer back
+// (GPU consumes it via CopyResource), so streaming the writes keeps 5-8MB/frame out of the cache.
+// _mm_sfence() publishes the weakly-ordered stores before Unmap/GPU read. Falls back to memcpy when
+// alignment doesn't permit movntdq (guards dst base, dst pitch, and rowBytes; src uses unaligned load).
+static inline void CopyRowsToStaging(uint8_t* dst, int dstPitch,
+	const uint8_t* src, int srcPitch, int rowBytes, int h)
+{
+	bool canStream = ((rowBytes & 15) == 0)
+		&& ((((uintptr_t)dst) & 15) == 0) && ((dstPitch & 15) == 0);
+	if (canStream) {
+		int n = rowBytes >> 4;
+		for (int y = 0; y < h; ++y) {
+			const __m128i* s = (const __m128i*)(src + (size_t)y * srcPitch);
+			__m128i* d = (__m128i*)(dst + (size_t)y * dstPitch);
+			for (int i = 0; i < n; ++i)
+				_mm_stream_si128(d + i, _mm_loadu_si128(s + i));
+		}
+		_mm_sfence();
+	}
+	else {
+		for (int y = 0; y < h; ++y)
+			memcpy(dst + (size_t)y * dstPitch, src + (size_t)y * srcPitch, rowBytes);
+	}
+}
+static void Flip_ReleaseAll()
+{
+	for (int i = 0; i < FL_STAGING_COUNT; ++i)
+		if (s_flStaging[i]) { s_flStaging[i]->Release(); s_flStaging[i] = nullptr; }
+	s_flStageRing = 0; s_flStageCur = 0;
+	if (s_flDcVis) { s_flDcVis->Release();   s_flDcVis = nullptr; }
+	if (s_flDcTgt) { s_flDcTgt->Release();   s_flDcTgt = nullptr; }
+	if (s_flDcDev) { s_flDcDev->Release();   s_flDcDev = nullptr; }
+	if (s_flSwap) { s_flSwap->Release();    s_flSwap = nullptr; }
+	if (s_flCtx) { s_flCtx->Release();     s_flCtx = nullptr; }
+	if (s_flDev) { s_flDev->Release();     s_flDev = nullptr; }
+	s_flW = s_flH = 0; s_flShown = false; s_flGrabbed = false;
+	s_flWaitable = nullptr; 
+}
+static HWND g_flFoundHwnd = nullptr;
+static BOOL CALLBACK Flip_EnumProc(HWND h, LPARAM)
+{
+	DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+	if (pid == GetCurrentProcessId() && IsWindowVisible(h)) { g_flFoundHwnd = h; return FALSE; }
+	return TRUE;
+}
+static HWND Flip_FindHwnd()
+{
+	__try {                                             // surface+1216 = hWnd 
+		uintptr_t surf = *(uintptr_t*)0x673D20;
+		if (surf > 0x10000 && surf < 0x7FFFFFFF) { HWND h = *(HWND*)(surf + 1216); if (h && IsWindow(h)) return h; }
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	__try {                                             // g_hWnd (WinMain)
+		HWND h = *(HWND*)0x673D18; if (h && IsWindow(h)) return h;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	g_flFoundHwnd = nullptr; EnumWindows(Flip_EnumProc, 0); return g_flFoundHwnd;   // last resort
+}
+static bool Flip_ReadSurfaceDims(int& w, int& h)
+{
+	__try {
+		uintptr_t surf = *(uintptr_t*)0x673D20;
+		if (surf > 0x10000 && surf < 0x7FFFFFFF) {
+			w = *(int*)(surf + 72); h = *(int*)(surf + 76);
+			return w >= 320 && w <= 7680 && h >= 240 && h <= 4320;
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	return false;
+}
+static bool Flip_EnsureSize(int w, int h)
+{
+	if (w == s_flW && h == s_flH && s_flStaging[0]) return true;
+	for (int i = 0; i < FL_STAGING_COUNT; ++i)
+		if (s_flStaging[i]) { s_flStaging[i]->Release(); s_flStaging[i] = nullptr; }
+	if ((w != s_flW || h != s_flH) && s_flSwap) {
+		HRESULT hr = s_flSwap->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN,
+			DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
+		if (FAILED(hr)) { Dbg("[FLIP] ResizeBuffers %dx%d hr=%08X\n", w, h, (unsigned)hr); return false; }
+	}
+	s_flW = w; s_flH = h;
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_STAGING; td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	for (int i = 0; i < g_flStageRingN; ++i) {
+		HRESULT hr = s_flDev->CreateTexture2D(&td, nullptr, &s_flStaging[i]);
+		if (FAILED(hr)) {
+			Dbg("[FLIP] staging[%d] %dx%d hr=%08X\n", i, w, h, (unsigned)hr);
+			for (int j = 0; j < FL_STAGING_COUNT; ++j)
+				if (s_flStaging[j]) { s_flStaging[j]->Release(); s_flStaging[j] = nullptr; }
+			return false;
+		}
+	}
+	s_flStageRing = 0; s_flStageCur = 0;
+	Dbg("[FLIP] staging ring: %d x %dx%d (%.1f MB total)\n",
+		g_flStageRingN, w, h, (double)g_flStageRingN * w * h * 4.0 / (1024.0 * 1024.0));
+	return true;
+}
+static void Flip_InstallEngineHijack();
+static bool Flip_Init(HWND hwnd, int w, int h)
+{
+	__try {
+		D3D_FEATURE_LEVEL fl;
+		HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+			D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, &s_flDev, &fl, &s_flCtx);
+		if (FAILED(hr) || !s_flDev) { Dbg("[FLIP] CreateDevice hr=%08X\n", (unsigned)hr); return false; }
+		IDXGIDevice1* dxdev = nullptr;
+		hr = s_flDev->QueryInterface(__uuidof(IDXGIDevice1), (void**)&dxdev);
+		if (FAILED(hr) || !dxdev) { Dbg("[FLIP] QI DXGIDevice1 hr=%08X\n", (unsigned)hr); return false; }
+		dxdev->SetMaximumFrameLatency(g_flipLatency);  // was 1
+		IDXGIAdapter* ad = nullptr;
+		hr = dxdev->GetAdapter(&ad);
+		if (FAILED(hr) || !ad) { Dbg("[FLIP] GetAdapter hr=%08X\n", (unsigned)hr); dxdev->Release(); return false; }
+		IDXGIFactory2* f = nullptr;
+		hr = ad->GetParent(__uuidof(IDXGIFactory2), (void**)&f); ad->Release();
+		if (FAILED(hr) || !f) { Dbg("[FLIP] GetFactory2 hr=%08X\n", (unsigned)hr); dxdev->Release(); return false; }
+		DXGI_SWAP_CHAIN_DESC1 sd = {};
+		sd.Width = w; sd.Height = h; sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		sd.SampleDesc.Count = 1; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+		sd.BufferCount = (UINT)(g_flipLatency + 1);   // was 2  -> latency+1 (3 for latency 2)
+		sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD; sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+		sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+		hr = f->CreateSwapChainForComposition(s_flDev, &sd, nullptr, &s_flSwap); f->Release();
+		if (FAILED(hr) || !s_flSwap) { Dbg("[FLIP] CreateSwapChainForComposition hr=%08X\n", (unsigned)hr); dxdev->Release(); return false; }
+		s_flW = w; s_flH = h;
+		{   // pacing mechanism without this, Present() never blocks,90fps + tear
+			IDXGISwapChain2* sc2 = nullptr;
+			if (SUCCEEDED(s_flSwap->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&sc2)) && sc2) {
+				sc2->SetMaximumFrameLatency(g_flipLatency);   
+				s_flWaitable = sc2->GetFrameLatencyWaitableObject();
+				sc2->Release();
+			}
+			if (s_flWaitable) Dbg("[FLIP] waitable acquired — vblank pacing armed\n");
+			else Dbg("[FLIP] WARNING no waitable (QI IDXGISwapChain2 failed) — will tear/90fps\n");
+		}
+		hr = DCompositionCreateDevice(dxdev, __uuidof(IDCompositionDevice), (void**)&s_flDcDev); dxdev->Release();
+		if (FAILED(hr) || !s_flDcDev) { Dbg("[FLIP] DCompositionCreateDevice hr=%08X\n", (unsigned)hr); return false; }
+		hr = s_flDcDev->CreateTargetForHwnd(hwnd, TRUE, &s_flDcTgt);
+		if (FAILED(hr) || !s_flDcTgt) { Dbg("[FLIP] CreateTargetForHwnd hr=%08X\n", (unsigned)hr); return false; }
+		hr = s_flDcDev->CreateVisual(&s_flDcVis);
+		if (FAILED(hr) || !s_flDcVis) { Dbg("[FLIP] CreateVisual hr=%08X\n", (unsigned)hr); return false; }
+		s_flDcVis->SetContent(s_flSwap);
+		s_flDcTgt->SetRoot(nullptr);            
+		s_flDcDev->Commit();
+		Dbg("[FLIP] init OK %dx%d hwnd=%p — DComp armed (expect Independent Flip)\n", w, h, hwnd);
+		if (g_flipSuppressEngine) Flip_InstallEngineHijack();   // <<< ADD
+
+		DEVMODEA dm = {}; dm.dmSize = sizeof dm;
+		if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+			g_refreshMs = 1000.0 / (double)dm.dmDisplayFrequency;
+
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { Dbg("[FLIP] init EXCEPTION\n"); return false; }
+}
+// Toggle the engine's own vsync. enable=false -> set NOVSYNC (surface+4|0x200): engine flip stops
+// blocking, so our Present(1,0) is the SOLE vsync wait (no double-block -> no 30fps). enable=true ->
+// clear it (menu: engine paces itself). Doc §4: nothing else writes 0x200, we're the only owner.
+static void Flip_EngineVsync(bool enable)
+{
+	__try {
+		uintptr_t surf = *(uintptr_t*)0x673D20;
+		if (surf <= 0x10000 || surf >= 0x7FFFFFFF) return;
+		DWORD* flags = (DWORD*)(surf + 4);
+		if (enable) *flags &= ~0x200u;   // vsync (default engine behaviour)
+		else        *flags |= 0x200u;   // NOVSYNC (we own the vblank)
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+// Single-presenter mode: swap the engine's Vid_FlipBuffers (@0x595044, populated at boot by
+// Vid_LoadSysDLL) for a stub. While OUR overlay is shown, the stub skips the engine's DDraw flip
+// entirely -> only our vsync'd DComp Present reaches the display -> no two-plane tear. The stub
+// SELF-GATES on s_flShown, so the menu (shown=0) flips normally. Same thread as the caller (render
+// thread) -> no locking needed.
+typedef int(__stdcall* fn_vidflip_t)(uintptr_t);
+static void* s_realFlipFn = nullptr;
+static int  __stdcall Flip_EngineFlipStub(uintptr_t surf)
+{
+	if (s_flShown && !s_flDead) return 0;                         // our present owns the screen: skip engine flip
+	if (s_realFlipFn) return ((fn_vidflip_t)s_realFlipFn)(surf);  // menu / dead: normal flip
+	return 0;
+}
+static void Flip_InstallEngineHijack()
+{
+	if (s_realFlipFn) return;
+	__try {
+		void* cur = *(void**)0x595044;                           // Vid_FlipBuffers fn-ptr
+		if (!cur || cur == (void*)&Flip_EngineFlipStub) return;
+		s_realFlipFn = cur;
+		DWORD o; VirtualProtect((void*)0x595044, sizeof(void*), PAGE_READWRITE, &o);
+		*(void**)0x595044 = (void*)&Flip_EngineFlipStub;
+		VirtualProtect((void*)0x595044, sizeof(void*), o, &o);
+		Dbg("[FLIP] engine flip hijacked (real=%p) — single-presenter mode\n", s_realFlipFn);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+static void Flip_Show()
+{
+	if (!s_flReady || s_flShown) return;
+	__try {
+		s_flDcTgt->SetRoot(s_flDcVis); s_flDcDev->Commit(); s_flShown = true;
+		if (!g_flipSuppressEngine && g_flipVsync) Flip_EngineVsync(false);   // novsync fallback ONLY when not suppressing
+		if (g_flipLog) Dbg("[FLIP] SHOWN (suppress=%d vsync=%d)\n", (int)g_flipSuppressEngine, (int)g_flipVsync);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+static void Flip_Hide()
+{
+	if (!s_flShown) return;
+	__try {
+		s_flDcTgt->SetRoot(nullptr); s_flDcDev->Commit(); s_flShown = false; s_flGrabbed = false;
+		if (!g_flipSuppressEngine) Flip_EngineVsync(true);                   // fallback path restores engine vsync
+		if (g_flipLog) Dbg("[FLIP] HIDDEN\n");
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// called from Hook_CxxRestore (0x4CAF50) — surface is still locked here
+static void Flip_Grab()
+{
+	if (!s_flReady || s_flDead) return;
+	__try {
+		LARGE_INTEGER a, b; QueryPerformanceCounter(&a);
+		uintptr_t surf = *(uintptr_t*)0x673D20;
+		if (surf <= 0x10000 || surf >= 0x7FFFFFFF) return;
+		uint8_t* src = *(uint8_t**)(surf + 80);
+		int pitch = *(int*)(surf + 84);
+		int w = *(int*)(surf + 72), h = *(int*)(surf + 76);
+		if (!src || (uintptr_t)src <= 0x10000) return;
+		if (w < 320 || w > 7680 || h < 240 || h > 4320) return;
+		if (pitch < w * 4) {                            // 16-bpp surface: needs 32bit_mode=1
+			static bool warned = false;
+			if (!warned) {
+				warned = true; Dbg("[FLIP] surface ~%d-bpp (pitch=%d) — flip_present needs 32bit_mode=1; disabling\n",
+					w ? pitch * 8 / w : 0, pitch);
+			}
+			InterlockedExchange(&s_flDead, 1); return;
+		}
+		if (!Flip_EnsureSize(w, h)) { InterlockedExchange(&s_flDead, 1); return; }
+		int idx = s_flStageRing;                        // write a DIFFERENT buffer than the GPU is reading
+		ID3D11Texture2D* stg = s_flStaging[idx];
+		if (!stg) return;
+		D3D11_MAPPED_SUBRESOURCE m;
+		if (FAILED(s_flCtx->Map(stg, 0, D3D11_MAP_WRITE, 0, &m))) return;
+		CopyRowsToStaging((uint8_t*)m.pData, (int)m.RowPitch, src, pitch, w * 4, h);
+		s_flCtx->Unmap(stg, 0);
+		s_flStageCur = idx;
+		s_flGrabbed = true; ++s_flGrabs;
+		QueryPerformanceCounter(&b);
+		g_lastGrabMs = (double)(b.QuadPart - a.QuadPart) * 1000.0 / g_qpf.QuadPart;
+		g_grabMsEma = g_grabMsEma * 0.9 + g_lastGrabMs * 0.1;
+		if (g_lastGrabMs > g_grabMsMax) g_grabMsMax = g_lastGrabMs;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+// called from Hook_Render, AFTER oRender() (engine's own flip already paced us to vsync)
+static void Flip_Present()
+{
+	if (!s_flReady || s_flDead || !s_flGrabbed || !s_flSwap) return;
+	ID3D11Texture2D* stg = s_flStaging[s_flStageCur];
+	if (!stg) return;
+	__try {
+		LARGE_INTEGER w0, w1, p1; QueryPerformanceCounter(&w0);
+		if (s_flWaitable) WaitForSingleObject(s_flWaitable, 100);
+		QueryPerformanceCounter(&w1);
+		ID3D11Texture2D* bb = nullptr;
+		if (FAILED(s_flSwap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb)) || !bb) return;
+		s_flCtx->CopyResource(bb, stg);
+		bb->Release();
+		UINT sync = g_flipVsync ? 1u : 0u;
+		HRESULT hr = s_flSwap->Present(sync, 0);
+		s_flGrabbed = false; ++s_flPresents;
+		s_flStageRing = (s_flStageRing + 1) % g_flStageRingN;   // advance AFTER the copy is queued
+		QueryPerformanceCounter(&p1);
+		g_lastWaitMs = (double)(w1.QuadPart - w0.QuadPart) * 1000.0 / g_qpf.QuadPart;
+		g_lastPresentMs = (double)(p1.QuadPart - w1.QuadPart) * 1000.0 / g_qpf.QuadPart;
+		g_waitMsEma = g_waitMsEma * 0.9 + g_lastWaitMs * 0.1;
+		g_presentMsEma = g_presentMsEma * 0.9 + g_lastPresentMs * 0.1;
+		if (FAILED(hr)) {
+			Dbg("[FLIP] Present hr=%08X -> permanent fallback to engine present\n", (unsigned)hr);
+			InterlockedExchange(&s_flDead, 1); Flip_Hide(); return;
+		}
+		if (!s_flShown) Flip_Show();
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+static void Flip_EnsureInit()
+{
+	if (!g_flipPresent || s_flReady || s_flDead) return;
+	if (!CameraPhys()) return;                          // only arm during a real game render
+	HWND hwnd = Flip_FindHwnd(); if (!hwnd) return;
+	int w = 0, h = 0; if (!Flip_ReadSurfaceDims(w, h)) return;
+	if (Flip_Init(hwnd, w, h) && Flip_EnsureSize(w, h)) s_flReady = true;
+	else {
+		Flip_ReleaseAll(); InterlockedExchange(&s_flDead, 1);
+		Dbg("[FLIP] init failed -> engine present fallback (screen uncovered)\n");
+	}
+}
+static void __cdecl Hook_CxxRestore()
+{
+	Flip_Grab();        // grab BEFORE the unlock (guards internally on ready/dead)
+	oCxxRestore();      // Vid_FreeSurface(g_surface): the real final unlock
+}
+
+///
+
+
 //
 
 //
@@ -1615,19 +2109,31 @@ static void BannerDedupReset()
 static char* __fastcall Hook_LevelStart(void* thisp, void* edx)
 {
 	Dbg("[Level] Level Start\n");
-	if(g_bannerDedup || g_bannerDedupCar)
-		BannerDedupReset();
-	// Start after the level-start hook is entered so the warmer does not
-	// delay level initialization on the main thread.
-
-	if(g_audioWarmUp)
-		StartAudioWarm();
+	static bool s_surfOnce = false;
+	if (g_surfClawback && !s_surfOnce) {
+		s_surfOnce = true;
+		if (!g_d3dBase) { HMODULE h = GetModuleHandleA("d3ddll.dll"); if (h) g_d3dBase = (uintptr_t)h; }
+		if (g_d3dBase) {
+			g_pE43E18 = g_d3dBase + 0x43E18;
+			void* bs = (void*)GetProcAddress((HMODULE)g_d3dBase, "gbh_BeginScene");
+			if (!bs) bs = (void*)(g_d3dBase + 0x4BF0);   // RVA fallback
+			if (bs && MH_CreateHook(bs, (void*)&Hook_BeginScene, (void**)&oBeginScene) == MH_OK
+				&& MH_EnableHook(bs) == MH_OK)
+				Dbg("[SURF] gbh_BeginScene hooked @%p (E43E18 force armed)\n", bs);
+			else Dbg("[SURF] gbh_BeginScene hook FAILED\n");
+			Patch_SurfClawback();
+		}
+		else Dbg("[SURF] d3ddll not found — clawback aborted\n");
+	}
+	if (g_bannerDedup || g_bannerDedupCar) BannerDedupReset();
+	if (g_audioWarmUp) StartAudioWarm();
 	return oLevelStart(thisp, edx);
 }
 
 static char* __cdecl Hook_SessionTeardown()
 {
 	Dbg("[Level] Level End/Game Quit?\n");
+	Flip_Hide();                       //  reveal engine content so the menu isn't under a stale frame
 	return oSessionTeardown();
 }
 // ---------- goal 1: banner shrink (scale-about-center) ----------
@@ -1698,11 +2204,31 @@ static void __stdcall Hook_DrawScaledStr(int a1, int a2, int a3, int a4)
 
 
 // -----------------------
+// Alpha() = interp fraction into the current 30Hz logic tick.
+
 static float Alpha()
 {
 	DWORD due = *(DWORD*)g.pNextDue;
-	DWORD ft = g_frametime ? g_frametime : 33;
-	double a = (double)(int)(timeGetTime() - (due - ft)) / (double)ft;
+	double ftd = (g_frametimeEMA > 1.0) ? g_frametimeEMA : 33.333;
+	DWORD now = timeGetTime();
+	double t = (double)(int)(now - due) + ftd;   // (now-due): DWORD-wrap-safe small signed; +ftd keeps the 0.333
+	if (g_nextVblankAlpha && g_haveVblank && g_qpf.QuadPart)
+	{
+		LARGE_INTEGER q; QueryPerformanceCounter(&q);
+		double sinceV = (double)(q.QuadPart - g_lastVblankQpc) * 1000.0 / (double)g_qpf.QuadPart;
+		double refresh = (g_refreshMs > 1.0) ? g_refreshMs : 16.667;
+		if (sinceV >= 0.0 && sinceV < 1000.0)
+		{
+			double ready = sinceV + g_sceneQPCema;         // frame isn't submitted until scene build done
+			double k = ceil(ready / refresh - 1e-6);       // which upcoming vblank catches this frame
+			double latency = k * refresh - sinceV;         // ms from now until that vblank displays it
+			if (latency < 0.0) latency = 0.0;
+			double capL = refresh + g_sceneQPCema + 1.0;
+			if (latency > capL) latency = capL;
+			t += latency;
+		}
+	}
+	double a = t / ftd;                  // was t / (double)ft
 	return a < 0 ? 0.f : (a > 1 ? 1.f : (float)a);
 }
 static int __fastcall Hook_Slots(void* thisp, void* edx)
@@ -1877,6 +2403,13 @@ static char __cdecl Hook_Logic()
 	CP(13);
 	if ((g_tick % 30) == 0)
 	{
+		if (g_flipPresent && g_debugLogic)
+			Dbg("[FLIP] ready=%d shown=%d dead=%d grabs=%u pres=%u %dx%d | grabEMA=%.2f grabMAX=%.2f presentEMA=%.2f waitEMA=%.2f ring=%d\n",
+				(int)s_flReady, (int)s_flShown, (int)s_flDead, s_flGrabs, s_flPresents, s_flW, s_flH,
+				g_grabMsEma, g_grabMsMax, g_presentMsEma, g_waitMsEma, g_flStageRingN);
+		s_flGrabs = 0; s_flPresents = 0;
+		g_grabMsMax = 0.0;
+
 		if (g_debugLogic)
 			Dbg("[60] tick#%u moved=%zu objs=%zu carLive=%d carMiss=%u dtor=%u deadN=%zu dualw=%u a=%.2f\n",
 				g_tick, g_moved.size(), g_obj.size(), g_liveCar, g_carMiss,
@@ -1917,6 +2450,21 @@ static char __cdecl Hook_Logic()
 				g_drawN ? g_drawSum / g_drawN : 0.0, g_drawMax, g_drawN, g_lastDrawCPU, g_lastPresentCPU, g_pumpBudgetMs, g_debt, g_pumpSkips,
 				*(int*)0x673E2C, *(BYTE*)0x673598);	// 0x673E2C = g_bMultiplayer, 0x673598 = g_frameSkipEnable
 			Dbg("[PERF4] g_presentQPCema=%.3f g_sceneQPCema=%.3f diff=%.3f\n", g_presentQPCema, g_sceneQPCema, g_presentQPCema - g_sceneQPCema);
+			if (g_dAN)
+			{
+				double mA = g_dASum / g_dAN, vA = g_dASumSq / g_dAN - mA * mA; if (vA < 0) vA = 0;
+				double mS = g_csN ? g_csSum / g_csN : 0.0, vS = g_csN ? g_csSumSq / g_csN - mS * mS : 0.0; if (vS < 0) vS = 0;
+				double mL = g_latN ? g_latSum / g_latN : 0.0, vL = g_latN ? g_latSumSq / g_latN - mL * mL : 0.0; if (vL < 0) vL = 0;
+				double cv = mS > 1.0 ? sqrt(vS) / mS : 0.0; 
+				Dbg("[PERF6] nvba=%d refresh=%.2f sc=%.1f | dA m=%.3f[%.3f..%.3f]sd=%.3f | camStep(t) m=%.4f sd=%.4f CV=%.2f | lat m=%.1f[%.1f..%.1f]sd=%.2f n=%u\n",
+					(int)g_nextVblankAlpha, g_refreshMs, g_sceneQPCema,
+					mA, g_dAMin, g_dAMax, sqrt(vA),
+					mS / 16384.0, sqrt(vS) / 16384.0, cv,
+					mL, g_latMin, g_latMax, sqrt(vL), g_dAN);
+			}
+			g_dASum = g_dASumSq = 0; g_dAMin = 1e9; g_dAMax = -1e9; g_dAN = 0;
+			g_csSum = g_csSumSq = 0; g_csN = 0;
+			g_latSum = g_latSumSq = 0; g_latMin = 1e18; g_latMax = 0; g_latN = 0;
 		}
 		g_drawSum = 0;
 		g_drawMax = 0;
@@ -1941,6 +2489,7 @@ static char __cdecl Hook_Logic()
 				Dbg("[PERF3] surf=%.2f map=%.2f spr2=%.2f ui=%.2f | child=%.2f remain=%.2f | drawEMA=%.1f engAdd=%u engDraw=%u (n=%u)\n",
 					surfMs, mapMs, spr2Ms, uiMs, child, g_lastDrawCPU - child, g_lastDrawCPU, da, dd, sn);
 			}
+
 			if (g_mapProfile)
 			{
 				double dedupMs = (g_mapCalls && g_tscPerMs > 0) ? ((double)g_dedupTsc / g_tscPerMs) / g_mapCalls : 0;
@@ -1955,6 +2504,7 @@ static char __cdecl Hook_Logic()
 	}
 	return r;
 }
+
 static char __cdecl Hook_Render()
 {
 	CP(20);
@@ -1969,21 +2519,46 @@ static char __cdecl Hook_Render()
 	}
 
 	LogVideoMode();
-
+	Flip_EnsureInit();
 	g_camPtr = CameraPhys();
+	LARGE_INTEGER qComposeStart; QueryPerformanceCounter(&qComposeStart);   // [PERF6] compose-time stamp
 	float a = Alpha();
 	if (g_doCamera && g_camPtr)
 	{
-		int n = g_camZ ? 3 : 2;           // [34/35/36]=prev x/y/z ; [38/39/40]=cur x/y/z
+		int n = g_camZ ? 3 : 2;
+		bool smoothed = false;
+		__try { smoothed = (g_camPtr[15] == 1); }
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
+		// once per tick (first render after Camera_Commit): promote chords
+		if (g_camHermite && smoothed && g_camVelTick != g_tick) {
+			for (int i = 0; i < 3; i++) {
+				g_camPrevVel[i] = g_camChord[i];
+				g_camChord[i] = g_camPtr[38 + i] - g_camPtr[34 + i];
+			}
+			g_camVelTick = g_tick;
+		}
+		double al = (double)a;
 		for (int i = 0; i < n; i++)
 		{
 			int32_t p = g_camPtr[34 + i];
 			int32_t c = g_camPtr[38 + i];
 			g_savedXY[i] = c;
-			if (llabs((int64_t)c - p) <= TELE)   // snap (don't swoop) on map-warps / level jumps
-			{
-				g_camPtr[38 + i] = p + (int32_t)llround((double)(c - p) * a);
+			int64_t D = (int64_t)c - p;
+			if (llabs(D) > TELE) { g_camPrevVel[i] = (int32_t)D; continue; }  // teleport: skip + reseed
+			int32_t off;
+			if (g_camHermite && smoothed) {
+				int64_t v = g_camPrevVel[i];
+				int64_t lo = (D > 0) ? 0 : 2 * D, hi = (D > 0) ? 2 * D : 0;       // same sign as D, |v|<=2|D|
+				if (v < lo) v = lo; if (v > hi) v = hi;                       // -> monotonic, no overshoot/hook
+				double t = al, t2 = t * t, t3 = t2 * t;
+				double herm = (double)D * (2 * t2 - t3) + (double)v * (t3 - 2 * t2 + t);
+				double lin = (double)D * t;
+				off = (int32_t)llround(lin + (herm - lin) * (g_camHermiteStrength * 0.01));
 			}
+			else {
+				off = (int32_t)llround((double)D * al);                      // unchanged linear path
+			}
+			g_camPtr[38 + i] = p + off;
 		}
 		g_savedRectValid = false;
 
@@ -1999,6 +2574,9 @@ static char __cdecl Hook_Render()
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) { g_savedRectValid = false; }
 	}
+	int32_t g6cx = 0, g6cy = 0;                                             // [PERF6] interpolated cam this present
+	if (g_camPtr) __try { g6cx = g_camPtr[38]; g6cy = g_camPtr[39]; }
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
 	CP(21);
 	g_savedObj.clear();
 	if (g_doObjs)
@@ -2029,7 +2607,8 @@ static char __cdecl Hook_Render()
 				kk = 15;
 
 			g_kindSeen[kk]++;
-
+			if (kk < 2)
+				continue;    // kind 0/1 never render (Disp_KindIsDrawable = kind>1): skip interp/restore/SNAP spam
 			if (s.px != s.cx || s.py != s.cy)
 				g_kindMove[kk]++;
 
@@ -2121,10 +2700,38 @@ static char __cdecl Hook_Render()
 	CP(24);
 	CP(25);
 	LARGE_INTEGER pa; QueryPerformanceCounter(&pa);
-	char r = oRender();
-	LARGE_INTEGER pb; QueryPerformanceCounter(&pb);
+	char r = oRender();                 // scene build + grab(@4CAF50) + engine flip (NOVSYNC while shown)
+	Flip_Present();                     // Present(1,0) = the vsync block
+	LARGE_INTEGER pb; QueryPerformanceCounter(&pb);   // pb AFTER the real present/vblank (same semantics as before)
 	double pres = (double)(pb.QuadPart - pa.QuadPart) * 1000.0 / (double)g_qpf.QuadPart;
 	g_presentQPCema = g_presentQPCema * 0.9 + pres * 0.1;
+	if (g_haveVblank) {
+		double iv = (double)(pb.QuadPart - g_lastVblankQpc) * 1000.0 / (double)g_qpf.QuadPart;
+		if (iv > 5.0 && iv < 25.0) g_refreshMs = g_refreshMs * 0.9 + iv * 0.1;
+	}
+	g_lastVblankQpc = pb.QuadPart; g_haveVblank = true;
+
+	if (g_debugLogic) {   // phase/judder stats only when logging
+		double lat = (double)(pb.QuadPart - qComposeStart.QuadPart) * 1000.0 / (double)g_qpf.QuadPart;
+		if (g_debugLogic && lat > 17.9)
+			Dbg("[DROP] lat=%.1f scene=%.1f grab=%.1f wait=%.1f present=%.1f | surf=%.1f map=%.1f spr2=%.1f ui=%.1f remain=%.1f\n",
+				lat, g_lastSceneMs, g_lastGrabMs, g_lastWaitMs, g_lastPresentMs,
+				g_fSurfMs, g_fMapMs, g_fSpr2Ms, g_fUiMs,
+				g_lastSceneMs - g_fSurfMs - g_fMapMs - g_fSpr2Ms - g_fUiMs);
+		if (lat < g_latMin) g_latMin = lat;
+		if (lat > g_latMax) g_latMax = lat;
+		g_latSum += lat; g_latSumSq += lat * lat; ++g_latN;
+		if (g_havePA) {
+			double dA = (double)a - g_lastPA; if (dA < -0.5) dA += 1.0;   // unwrap tick boundary
+			if (dA < g_dAMin) g_dAMin = dA;
+			if (dA > g_dAMax) g_dAMax = dA;
+			g_dASum += dA; g_dASumSq += dA * dA; ++g_dAN;
+			double ddx = (double)(g6cx - g_lastPCamX), ddy = (double)(g6cy - g_lastPCamY);
+			double step = sqrt(ddx * ddx + ddy * ddy);
+			g_csSum += step; g_csSumSq += step * step; ++g_csN;
+		}
+		g_lastPA = a; g_lastPCamX = g6cx; g_lastPCamY = g6cy; g_havePA = true;
+	}
 	CP(26);
 
 	for (auto& s : g_savedObj)
@@ -2151,7 +2758,7 @@ static char __cdecl Hook_Render()
 	g_lastPresentCPU = g_lastPresentCPU * 0.6 + (double)rd * 0.4;   // <-- feeds the pump gate (FULL present cost, incl BitBlt/flip)
 	return r;
 }
-
+static uint32_t g_lastPumpTick = 0xFFFFFFFFu;   // file scope
 
 static char __cdecl Hook_Tick()
 {
@@ -2163,8 +2770,12 @@ static char __cdecl Hook_Tick()
 	if (due != g_prevDue)
 	{
 		DWORD ft = due - g_prevDue;
-		if (g_prevDue && ft > 0 && ft < 500)
-			g_frametime = ft;
+		if (g_prevDue && ft > 0 && ft < 500) {
+
+			double s = (double)ft;
+			if (s <= 45.0) g_frametimeEMA = g_frametimeEMA * 0.90 + s * 0.10;
+			g_frametime = (DWORD)(g_frametimeEMA + 0.5);
+		}
 		g_prevDue = due;
 	}
 	// Gate on the REAL present cost (g_lastPresentCPU = EMA of the whole Game_RenderPresent incl
@@ -2175,21 +2786,15 @@ static char __cdecl Hook_Tick()
 	int timeLeft = (int)(due - now);                              // handles DWORD wrap for small deltas
 	int need = g_adaptivePump ? (int)(g_lastPresentCPU + 3.0) : 6;
 	if (need < 6) need = 6;                                       // keep the old 6ms floor
-	if (g_doPump && CameraPhys() && timeLeft > need)
-	{
+	if (g_doPump && CameraPhys() && timeLeft > need && g_lastPumpTick != g_tick) {
 		DWORD cap = (DWORD)(1000.0 / g_capFps);
-		if ((now - g_lastPump) >= cap)
-		{
-			g_lastPump = now;
-			++g_pumpN;
-			CP(2);
+		if ((now - g_lastPump) >= cap) {
+			g_lastPumpTick = g_tick;    // at most ONE pump per logic tick
+			g_lastPump = now; ++g_pumpN; CP(2);
 			((fn_t)g.render)();
 		}
 	}
-	else if (g_doPump)
-	{
-		++g_pumpSkips;
-	}
+	else if (g_doPump) ++g_pumpSkips;
 	CP(3);
 	return r;
 }
@@ -2232,10 +2837,40 @@ static int __stdcall Hook_RegGetInt(const char* name, int def)
 	}
 	return oRegGetInt(name, def);
 }
+
+static void ValidateConfig()
+{
+
+	if (!g_bApply32bpp)
+	{
+		if (g_flipPresent) { g_flipPresent = false; Dbg("[CFG] flip_present needs 32bit_mode=1 -> OFF\n"); }
+		if (g_surfClawback) { g_surfClawback = false; Dbg("[CFG] surf_clawback needs 32bit_mode=1 -> OFF\n"); }
+	}
+	// flip_* sub-knobs do nothing without the presenter -- nudge once, don't fight the user.
+	if (!g_flipPresent &&
+		(!g_flipVsync || !g_flipSuppressEngine || g_flipLatency != 2 || g_flStageRingN != 3))
+		Dbg("[CFG] flip_present=0 -> flip_vsync/latency/suppress_engine/staging_ring are inert\n");
+
+	if (g_camHermiteStrength < 0)   g_camHermiteStrength = 0;
+	if (g_camHermiteStrength > 100) g_camHermiteStrength = 100;
+
+	if (g_zoomMax < 0) g_zoomMax = 0;
+	if (g_zoomMin < 0) g_zoomMin = 0;
+	if (g_zoomMin > g_zoomMax)
+	{
+		Dbg("[CFG] zoom_min(%d) > zoom_max(%d) -> zoom_min=zoom_max\n", g_zoomMin, g_zoomMax);
+		g_zoomMin = g_zoomMax;
+	}
+	if (g_zoomOffset > g_zoomMax) g_zoomOffset = g_zoomMax;
+	if (g_zoomOffset < g_zoomMin) g_zoomOffset = g_zoomMin;
+	// only 60 is actually tested; keep capfps out of the absurd (crash-safe either way)
+	if (g_capFps > 240.0) { Dbg("[CFG] capfps clamped to 240\n"); g_capFps = 240.0; }
+}
 static void Init()
 {
-	LoadConfig();                       // read ini FIRST (sets g_logEnabled, ...)
+	LoadConfig(); 
 	if (g_logEnabled) { LogOpen(); LogInitRing(); }
+	ValidateConfig();
 
 // broken currently
 //	{
@@ -2260,8 +2895,12 @@ static void Init()
 	if (HMODULE dh = LoadLibraryA("dbghelp.dll"))
 		p_MiniDumpWriteDump = (fn_MiniDumpWriteDump)GetProcAddress(dh, "MiniDumpWriteDump");
 
-	Dbg("[60] ==== ddraw proxy start ==== pump=%d(adapt=%d,budget=%.0f) objs=%d cam=%d camz=%d fdirty=%d predirty=%d unifyres=%d deadset=%d log=%d child=%d map=%d cap=%.0f\n",
-		g_doPump, g_adaptivePump, g_pumpBudgetMs, g_doObjs, g_doCamera, g_camZ, g_forceDirty, g_preDirty, g_unifyRes, g_useDeadSet, g_logEnabled, g_childProfile, g_mapProfile, g_capFps);
+	Dbg("[60] ==== ddraw proxy start ==== pump=%d(adapt=%d,budget=%.0f) objs=%d cam=%d camz=%d fdirty=%d predirty=%d unifyres=%d deadset=%d log=%d child=%d map=%d cap=%.0f nvba=%d\n",
+		g_doPump, g_adaptivePump, g_pumpBudgetMs, g_doObjs, g_doCamera, g_camZ, g_forceDirty, g_preDirty, g_unifyRes, g_useDeadSet, g_logEnabled, g_childProfile, g_mapProfile, g_capFps, (int)g_nextVblankAlpha);
+	Dbg("[FLIP] flip_present=%d vsync=%d suppress_engine=%d log=%d staging_ring=%d (needs 32bit_mode=%d)\n",
+		(int)g_flipPresent, (int)g_flipVsync, (int)g_flipSuppressEngine,
+		(int)g_flipLog, g_flStageRingN, (int)g_bApply32bpp);
+	
 	timeBeginPeriod(1);
 	QueryPerformanceFrequency(&g_qpf);
 	if (g_mapProfile)
@@ -2312,6 +2951,15 @@ static void Init()
 			}
 		}
 	}
+	if (g_collectibleCounter) {
+		if (MH_CreateHook((void*)0x43E550, (void*)&Hook_TryCollectPickup, (void**)&oTryCollect) != MH_OK)
+			Dbg("[60] hook TryCollectPickup FAILED\n");
+	}
+	if (g_flipPresent) {
+		if (MH_CreateHook((void*)0x4CAF50, (void*)&Hook_CxxRestore, (void**)&oCxxRestore) != MH_OK)
+			Dbg("[FLIP] hook CxxRestore@4CAF50 FAILED\n");
+	}
+
 	if (g_bApply32bpp || g_menuScale) {
 		if (MH_CreateHook((void*)0x452E20, (void*)&Hook_FrontendLoadMenuBgImages,
 			(void**)&o_FrontendLoadMenuBgImages) != MH_OK)
@@ -2345,7 +2993,10 @@ static void Init()
 	}
 	if (g_childProfile)
 	{
-		if (MH_CreateHook((void*)g.surf, (void*)&Hook_Surf, (void**)&oSurf) != MH_OK) Dbg("[60] hook surf FAILED\n");
+		if (!g_surfClawback) {
+			if (MH_CreateHook((void*)g.surf, (void*)&Hook_Surf, (void**)&oSurf) != MH_OK) Dbg("[60] hook surf FAILED\n");
+		}
+		else Dbg("[60] childprofile: surf hook SKIPPED (surf_clawback owns 4CAEC0)\n");
 		if (MH_CreateHook((void*)g.spr2, (void*)&Hook_Spr2, (void**)&oSpr2) != MH_OK) Dbg("[60] hook spr2 FAILED\n");
 		if (MH_CreateHook((void*)g.ui, (void*)&Hook_Ui, (void**)&oUi) != MH_OK) Dbg("[60] hook ui FAILED\n");
 	}

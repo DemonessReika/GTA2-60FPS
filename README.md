@@ -7,6 +7,13 @@ Compatible GTA2 version:
 - Untested on newer versions.
 # Changelog
 
+## v1.05
+- Added "collectible_counter" .ini toggle, when set to 1 will let you see the amount of special tokens you collected so far on each map (special token = one of 50 gta 2 logo pickups)
+- In-game now runs under DirectX11 reducing majority of cpu/gpu related issues.
+- Camera is now fully 60-fps smooth, the desynchronization with higher speeds due to vblank miscalculations is solved.
+- Removed legacy throttling of the vsync frames.
+- Project is kinda feature complete aside from fixing widescreen compat, adding windowed mode and above 60 fps support such as 120 or 240.
+
 ## v1.03.1 
 - Disabled Auto-Compatibility with widescreen fix, feature broken currently. It might work with widescreen fix assuming you manually tinker with .ini properties.
 
