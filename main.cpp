@@ -22,13 +22,11 @@
 
 #include <d3d11.h>
 #include <dxgi1_3.h>
+#include <dxgi1_4.h>
 #include <dcomp.h>
 #pragma comment(lib,"d3d11.lib")
 #pragma comment(lib,"dxgi.lib")
 #pragma comment(lib,"dcomp.lib")
-
-
-#include "gta2_ws_compat.h"
 
 #pragma comment(lib,"winmm.lib")
 #pragma comment(lib,"psapi.lib")
@@ -115,17 +113,31 @@ static bool g_bApply32bpp = true;
 
 static bool g_tileListOptimization = true;   // ini "tilelist_opt"
 
+
 // ---- manual zoom: drive HEIGHT target [6]; engine propagates to [40]->[30..33]->[8..11] ----
-static bool     g_zoom = true;     // "zoom"
-static int32_t  g_zoomOffset = 0;         // persistent user offset (Q14), additive on speed-zoom base
-static int32_t  g_zoomStep = 2048;      // "zoom_step"  per-tick while held (0.125/tick)
-static int32_t  g_zoomMax = 73728;     // "zoommax"   +5.0  -> total height ~6.0
-static int32_t  g_zoomMin = 0;         // "zoommin"   0 = never dip below speed-zoom baseline
-static int      g_zoomKeys = 1;         // "zoomkeys"  0=numpad +/- , 1=main-row -/=
-static const int32_t Z_ENGINE_MAX = 14 << 14;   // 229376, straight from Camera_ClampZoom (5E3D54)
+static bool     g_zoom = true;      // ini "zoom"          master on/off
+static int      g_zoomKeys = 1;         // ini "zoom_keys"     0 = numpad +/- , 1 = main-row -/=
+static int32_t  g_zoomOffset = 0;         // ini "zoom_offset"   persistent zoom-out amount (Q14)
+static int32_t  g_zoomStep = 2048;      // ini "zoom_step"     per-tick while held
+static int32_t  g_zoomMax = 73728;     // ini "zoom_max"
+static int32_t  g_zoomMin = 0;         // ini "zoom_min"      0 = never below speed-zoom baseline
+static int      g_zoomPersp = 0;         // ini "zoom_perspective"     0..100 (0 = original/flat)
 
+static bool g_zoomPerspAllowTogglingWithNumKeys = false;
 
-// HUD Fix
+static int      g_zoomPerspAlt = 25;       // ini "zoom_perspective_alt" what num2 flips to
+// --- fixed internals (tuning done; no ini clutter — edit here only if you must) ---
+static const int32_t Z_ENGINE_MAX = 14 << 14; // Camera_ClampZoom ceiling (229376)
+static const int32_t Z_CULL_BIAS = 16384;    // kCamHeightBiasQ14 = 1 tile (sprite-cull bias)
+static const int32_t g_zoomPerspBias = 131072;   // 8 tiles = Cam_ProjectVertex literal depth (framing-exact)
+static int      g_zoomPerspKey = 0x62;    // numpad 2 : toggle persp <-> persp_alt
+static int      g_zoomPerspDnKey = 0x61;    // numpad 1 : persp -
+static int      g_zoomPerspUpKey = 0x63;    // numpad 3 : persp +
+static int      g_zoomPerspStep = 10;      // nudge amount
+static bool     g_zoomPerspSnap = true;    // instant flip on toggle (no warp)
+static bool     g_zoomCullFix = true;    // widen sprite cull toward B (no edge pop)
+static uint32_t g_zoomSnapTick = 0xFFFFFFFFu;
+
 
 static bool g_menuScale = true;                // menu_scale_fix
 static bool g_skipIntro = false;	// skip_intro
@@ -186,7 +198,7 @@ static fn_tileadd_t oTileAdd = nullptr;
 
 struct {
 	uintptr_t tick, render, logic, pos, pSession, pNextDue, pCarHead, pPedHead, dtor, scene,
-		maplayers, tileadd, surf, spr2, ui, modegate, slots, camcommit,
+		maplayers, tileadd, surf, spr2, ui, modegate, slots, slotsOne, camcommit,
 		areaBanner, vehBanner, drawIcon, drawSprite, drawScaledStr,
 		levelStart, sessionTeardown;
 } g;
@@ -210,6 +222,7 @@ static void UseHardcoded()
 	g.ui = 0x4CA440;			// Hud_DrawAll: (ENTIRE HUD pass)
 	g.modegate = 0x4CB290;		// Vid_ModeGate: frontend/gameplay res decision (unifyres hook target)
 	g.slots = 0x4C84C0;			// Marker_DrawAll: Mission arrow stuff.
+	g.slotsOne = 0x4C82C0;		// Marker_DrawOne: Mission arrow stuff, we use this one for making post-game better.
 	g.camcommit = 0x41F2F0;		// Camera::Commit
 	// --- v102: banner shrink ---
 	g.areaBanner = 0x4C9890;  // Hud_DrawAreaNameBanner    (Hud_DrawAll call #8)
@@ -222,9 +235,126 @@ static void UseHardcoded()
 	g.sessionTeardown = 0x462060;	// Session_Teardown: Game exit or entering back main menu
 }
 
+static uint32_t g_tick = 0;
+
+static int  g_hideEndMarkerWhenFurtherThan = 12;
+// end level arrow grace timer (keep exit arrow visible x sec after score hits max))
+static int      g_endArrowGraceSeconds = 25;    // ini "endlevel_arrow_grace_seconds" (0 = off = old behaviour)
+static bool     g_endArrowReached = false; // score currently >= winning score this run
+static uint32_t g_endArrowReachTick = 0;     // g_tick at the latest score>=max rising edge
+
+typedef void(__fastcall* fn_markerDrawOne)(void*, void*);
+static fn_markerDrawOne oDrawOne = nullptr;
+
+typedef bool(__fastcall* fn_Mission_HasArrowOverride)(void*, void*);
+static const fn_Mission_HasArrowOverride Mission_HasArrowOverrideFn = (fn_Mission_HasArrowOverride)0x4C7350;
+
+static int GetPlayerScore()
+{
+	__try {
+		uintptr_t s = *(uintptr_t*)g.pSession;
+		if (s < 0x10000 || s > 0x7FFFFFFF) return false;
+		uintptr_t player = *(uintptr_t*)(s + 28);          // session[7] = local player
+		if (player < 0x10000 || player > 0x7FFFFFFF) return false;
+		int score = *(int*)(player + 724);       // player+724 = score, may need extra deref, 
+
+		return score;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static uintptr_t       g_pHud = 0x672F40;        // <<< g_hud (pointer var) — NEED THIS
+
+typedef void(__thiscall* fn_getctrlxyz_t)(void* player, int* x, int* y, int* z);
+static const fn_getctrlxyz_t Player_GetControlledWorldXYZ_fn = (fn_getctrlxyz_t)0x4A6610;
+// local player's position (ped on foot, or the car it's driving)
+static bool GetControlledPos(int32_t& x, int32_t& y, int32_t& z)
+{
+	__try {
+		uintptr_t s = *(uintptr_t*)g.pSession;
+		if (s < 0x10000 || s > 0x7FFFFFFF) return false;
+		uintptr_t player = *(uintptr_t*)(s + 56);          // session[14] = local player (engine uses this)
+		if (player < 0x10000 || player > 0x7FFFFFFF) return false;
+		int px = 0, py = 0, pz = 0;
+		Player_GetControlledWorldXYZ_fn((void*)player, &px, &py, &pz);
+		x = px; y = py; z = pz;
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// marker's active part world XYZ (Marker+120 = active MarkerPart; part+20/24/28 = resolved world pos)
+static bool GetMarkerWorldPos(void* markerBase, int32_t& x, int32_t& y, int32_t& z)
+{
+	__try {
+		uintptr_t m = (uintptr_t)markerBase;
+		uintptr_t part = *(uintptr_t*)(m + 120);           // active MarkerPart ptr
+		if (part < 0x10000 || part > 0x7FFFFFFF) return false;
+		if (*(int32_t*)(part + 16) == 0) return false;     // part type 0 = free/unresolved aka can't gate
+		x = *(int32_t*)(part + 20);
+		y = *(int32_t*)(part + 24);
+		z = *(int32_t*)(part + 28);
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// 2D (top-down) range test, worldDist in whole world units (for examplee 128 tiles)
+static bool __forceinline IsBeyond2D(int64_t dx, int64_t dy, int64_t worldDist)
+{
+	const int64_t q14 = worldDist * 16384;
+	return (dx * dx + dy * dy) > (q14 * q14);
+}
+
+static const uintptr_t ADDR_pMissionState = 0x6644BC;
+static int GetScoreMax()
+{
+	__try {
+		uintptr_t ms = *(uintptr_t*)ADDR_pMissionState;
+		if (ms < 0x10000 || ms > 0x7FFFFFFF) return 0;
+		return ((int*)ms)[196];      // mission[196] = $$$ needed until won map on single player, not sure about multiplayer though.
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+static bool __forceinline IsBeyondQ14DistSq(int64_t dx, int64_t dy, int64_t dz, int64_t worldDist)
+{
+	// worldDist is in whole world units (64). Convert to Q14 once.
+	const int64_t q14 = worldDist * 16384;
+	return (dx * dx + dy * dy + dz * dz) > (q14 * q14);
+}
+static bool g_bhideEndLevelArrowIf_Far = false;
+static void __fastcall Hook_SlotsOne(void* thisp, void* edx)
+{
+	if (g_hideEndMarkerWhenFurtherThan == 0 || !g_bhideEndLevelArrowIf_Far) { oDrawOne(thisp, edx); return; }
+	int iArrowKind = *(int*)((char*)thisp + 32);           // Marker+32 = kind (5 = gang/exit arrow)
+	if (iArrowKind == 5 && (!Mission_HasArrowOverrideFn(*(void**)ADDR_pMissionState, 0)))
+	{
+		bool inGrace = false;
+		if (g_endArrowGraceSeconds > 0 && g_endArrowReached)
+		{
+			uint32_t elapsed = g_tick - g_endArrowReachTick;
+			uint32_t graceTicks = (uint32_t)g_endArrowGraceSeconds * 30u;
+			inGrace = (elapsed < graceTicks);
+		}
+		if (!inGrace)
+		{
+			int32_t tx, ty, tz, px, py, pz;
+			if (GetMarkerWorldPos(thisp, tx, ty, tz) && GetControlledPos(px, py, pz))
+			{
+				int64_t dx = (int64_t)tx - px;
+				int64_t dy = (int64_t)ty - py;
+				if (IsBeyond2D(dx, dy, g_hideEndMarkerWhenFurtherThan))
+					return;                                 // beyond range we suppress
+			}
+			// couldn't resolve a position we draw normally (fail visible)
+		}
+	}
+	oDrawOne(thisp, edx);
+}
+//
+
 static BYTE* const g_pFrontendFlag = (BYTE*)0x595018;  // g_frontendActive: 1 while frontend/menu active
 
 static uintptr_t g_d3dBase = 0;
+
 
 // ---- logging ----------------------------------------------------------
 // ---- async logging: lock-free MPSC ring + dedicated flush thread -------------------
@@ -502,55 +632,59 @@ static void LogVideoMode()
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-
-
-//
-
 static bool g_collectibleCounter = false;   // ini "collectible_counter"
 static bool g_collectibleShowTotal = false;   // ini "collectible_show_total" (1="X OF Y", 0="X")
 static int  g_collectibleMsgTicks = 90;     // ini "collectible_msg_ticks" (HUD timer, 1..255)
 
 static const uintptr_t g_pFxMgr = 0x665788;          // g_fxMgr (pointer var) CONFIRMED
-static uintptr_t       g_pHud = 0x672F40;        // <<< g_hud (pointer var) — NEED THIS
+
 typedef char(__fastcall* fn_trycollect_t)(void*, void*, int);
 static fn_trycollect_t oTryCollect = nullptr;
 typedef char(__fastcall* fn_islocal_t)(void*, void*);
 typedef void(__fastcall* fn_layout1_t)(void*, void*);
 static const fn_islocal_t Player_IsLocal_fn = (fn_islocal_t)0x41DC70;
 static const fn_layout1_t Hud_LayoutCenteredText1_fn = (fn_layout1_t)0x4C69D0;
+
+static const uintptr_t g_gameSetup = 0x5EC070;               // the struct, not pointer to struct!
+static const uintptr_t kProgressCounterOff = 349 * 4;        // 1396 / 0x574
+static inline int GameSetup_GetProgressCounter()
+{
+	// g_gameSetup is static data. we just do a fixed address read.
+	return *(int*)(g_gameSetup + kProgressCounterOff);
+}
+
 static void ShowCollectibleMessage()
 {
 	__try {
-		uintptr_t fx = *(uintptr_t*)g_pFxMgr;
-		if (fx < 0x10000 || fx > 0x7FFFFFFF) return;
-		int total = *(int*)(fx + 84);
-		if (total < 0) total = 0; if (total > 50) total = 50;
-		int remaining = 0;
-		for (int i = 0; i < total; i++)
-			if (*(uint8_t*)(fx + 32 + i)) remaining++;        // ONLY [0..total-1]
-		int collected = total - remaining;
+		int collected = GameSetup_GetProgressCounter();       // actual running total
+		if (collected < 0) collected = 0;
+		int total = 0;
+		if (g_collectibleShowTotal)                           // only need total if i print it
+		{
+			uintptr_t fx = *(uintptr_t*)g_pFxMgr;
+			if (fx >= 0x10000 && fx <= 0x7FFFFFFF)
+			{
+				total = *(int*)(fx + 84);
+				if (total < 0) total = 0; if (total > 50) total = 50;
+			}
+		}
 		if (!g_pHud) return;
 		uintptr_t hud = *(uintptr_t*)g_pHud;
 		if (hud < 0x10000 || hud > 0x7FFFFFFF) return;
 		uint8_t* slot = (uint8_t*)(hud + 10168);              // CenteredText1
 		wchar_t text[64];
 		if (g_collectibleShowTotal)
-		{
 			_snwprintf(text, 63, L"%d OF %d TOKENS COLLECTED", collected, total);
-		}
+		else if (collected == 1)
+			_snwprintf(text, 63, L"%d TOKEN COLLECTED", collected);
 		else
-		{
-			if (collected > 1)
-				_snwprintf(text, 63, L"%d TOKENS COLLECTED", collected);
-			else
-				_snwprintf(text, 63, L"%d TOKEN COLLECTED", collected);
-		}
+			_snwprintf(text, 63, L"%d TOKENS COLLECTED", collected);
 		text[63] = 0;
 		int t = g_collectibleMsgTicks; if (t < 1) t = 1; if (t > 255) t = 255;
-		slot[0] = (uint8_t)t;                                 // display timer (counts down)
-		lstrcpynW((wchar_t*)(slot + 2), text, 60);            // string at +2
-		Hud_LayoutCenteredText1_fn(slot, nullptr);            // centered width -> +132
-		if (g_debugLogic) Dbg("[COLLECT] %d/%d (remain=%u)\n", collected, total, remaining);
+		slot[0] = (uint8_t)t;
+		lstrcpynW((wchar_t*)(slot + 2), text, 60);
+		Hud_LayoutCenteredText1_fn(slot, nullptr);
+		if (g_debugLogic) Dbg("[COLLECT] total=%d (fxtotal=%d)\n", collected, total);
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
 }
@@ -743,6 +877,36 @@ static int s_flStageCur = 0;         // buffer grabbed this frame (consumed by p
 // long after our Init() and after d3ddll is loaded -> no boot race.
 typedef void(__cdecl* fn_loadbg_t)();
 static fn_loadbg_t o_FrontendLoadMenuBgImages = nullptr;
+
+// ---- windowed / borderless / resizable (window_mode) ----
+static int  g_windowMode = 0;      // "window_mode": 0 exclusive-FS(engine default) / 1 borderless / 2 windowed-resizable
+static int  g_winW = 0, g_winH = 0;        // live client size (also what the reg hook feeds window_width/height)
+static volatile bool g_inVidReconf = false;// re-entrancy guard around Vid_Reconfigure
+// 4K+ scanline-table insurance (dword_E43F40[1700]; D3D path never reads  it, so clamping the write is free)
+static bool g_highresScanlineFix = true;   // "highres_scanline_fix"
+static int  g_scanlineMax = 1700;          // "scanline_max" = real dword_E43F40 capacity (DO NOT exceed)
+// SceneNode pool-full guard, 1000 sprites total across all 7 buckets)
+static bool g_sceneNodeGuard = true;       // "scenenode_guard"
+static const uintptr_t ADDR_VidSetWindowed = 0x4CB730;
+static const uintptr_t ADDR_VidWindowedAllowed = 0x4CB720;
+static const uintptr_t ADDR_VidReconfigure = 0x4CC5C0;
+static const uintptr_t ADDR_VidReapplyViewport = 0x4CB880;   // (palettes + ApplyResolutionToSession)
+static const uintptr_t ADDR_GameWndProc = 0x4D0A00;
+static int* const g_pStartMode = (int*)0x595014;       // g_startMode
+static int* const g_pLastViewportDim = (int*)0x6735A0;       // g_lastViewportDim (relayout guard)
+
+// 4K+ scanline clamp 
+typedef int(__stdcall* fn_makescreentable_t)(int, int, int);
+static fn_makescreentable_t oMakeScreenTable = nullptr;
+static int __stdcall Hook_MakeScreenTable(int base, int pitch, int height)
+{
+	if (g_highresScanlineFix && height > g_scanlineMax) {
+		static bool warned = false;
+		if (!warned) { warned = true; Dbg("[SCAN] height %d > cap %d -> clamp (table unused by D3D)\n", height, g_scanlineMax); }
+		height = g_scanlineMax;
+	}
+	return oMakeScreenTable(base, pitch, height);
+}
 static void __cdecl Hook_FrontendLoadMenuBgImages()
 {
 	static bool once = false;
@@ -762,6 +926,11 @@ static void __cdecl Hook_FrontendLoadMenuBgImages()
 				void* b = (void*)GetProcAddress(h, "gbh_BlitImage");
 				if (b && MH_CreateHook(b, (void*)&Hook_gbhBlitImage, (void**)&o_gbhBlitImage) == MH_OK) MH_EnableHook(b);
 				Dbg("[MENU32] scale quad=%s blit=%s\n", o_gbhDrawQuad ? "ok" : "FAIL", o_gbhBlitImage ? "ok" : "FAIL");
+			}
+			if (g_highresScanlineFix) {
+				void* ms = (void*)GetProcAddress(h, "MakeScreenTable");
+				if (ms && MH_CreateHook(ms, (void*)&Hook_MakeScreenTable, (void**)&oMakeScreenTable) == MH_OK) MH_EnableHook(ms);
+				Dbg("[SCAN] MakeScreenTable %s\n", oMakeScreenTable ? "hooked" : "FAIL");
 			}
 		}
 		else Dbg("[MENU32] d3ddll not loaded\n");
@@ -970,15 +1139,15 @@ static double g_fSurfMs = 0, g_fMapMs = 0, g_fSpr2Ms = 0, g_fUiMs = 0; // per-FR
 static void __fastcall Hook_SceneDraw(void* thisp, void* edx)
 {
 	DWORD t = timeGetTime();
-	int64_t s0 = g_qcSurf, m0 = g_qcMap, p0 = g_qcSpr2, u0 = g_qcUi;       
+	int64_t s0 = g_qcSurf, m0 = g_qcMap, p0 = g_qcSpr2, u0 = g_qcUi;
 	LARGE_INTEGER pa; QueryPerformanceCounter(&pa);
 	oSceneDraw(thisp, edx);
 	LARGE_INTEGER pb; QueryPerformanceCounter(&pb);
-	double invms = g_qpf.QuadPart ? 1000.0 / (double)g_qpf.QuadPart : 0.0;  
-	g_fSurfMs = (double)(g_qcSurf - s0) * invms;                            
-	g_fMapMs = (double)(g_qcMap - m0) * invms;                            
-	g_fSpr2Ms = (double)(g_qcSpr2 - p0) * invms;                            
-	g_fUiMs = (double)(g_qcUi - u0) * invms;                            
+	double invms = g_qpf.QuadPart ? 1000.0 / (double)g_qpf.QuadPart : 0.0;
+	g_fSurfMs = (double)(g_qcSurf - s0) * invms;
+	g_fMapMs = (double)(g_qcMap - m0) * invms;
+	g_fSpr2Ms = (double)(g_qcSpr2 - p0) * invms;
+	g_fUiMs = (double)(g_qcUi - u0) * invms;
 	double pres = (double)(pb.QuadPart - pa.QuadPart) * 1000.0 / (double)g_qpf.QuadPart;
 	g_lastSceneMs = pres;   // the QPC 'pres' you already compute
 	g_sceneQPCema = g_sceneQPCema * 0.9 + pres * 0.1;
@@ -995,26 +1164,52 @@ static void __fastcall Hook_SceneDraw(void* thisp, void* edx)
 }
 static bool SessionIsPaused()
 {
-	__try {
-		uintptr_t s = *(uintptr_t*)g.pSession;
-		return s && *(int*)s == 2;          // *session==2 == paused 
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+	uintptr_t s = *(uintptr_t*)g.pSession;
+	return s && *(int*)s == 2;          // *session==2 == paused 
 }
+
+static uint32_t g_frame = 0;
 typedef int(__fastcall* fn_camcommit_t)(void*, void*);
 static fn_camcommit_t oCamCommit = nullptr;
 static int __fastcall Hook_CamCommit(void* thisp, void* edx)
 {
+	bool applied = false; double cullRatio = 1.0;
 	if (g_zoom && g_zoomOffset && !SessionIsPaused())
 		__try {
 		int32_t* cam = (int32_t*)thisp;
-		int32_t z = cam[6] + g_zoomOffset;          // [6] = staged height target
-		if (z > Z_ENGINE_MAX) z = Z_ENGINE_MAX;     // respect engine's own ceiling
-		if (z < 0) z = 0;
-		cam[6] = z;
+		int32_t z0 = cam[6], zoom0 = cam[7], off = g_zoomOffset;      // staged alt (speed-varying) + zoom (const)
+		double B = (double)g_zoomPerspBias, p = (double)g_zoomPersp * 0.01;
+		double cam40 = (double)z0 + (1.0 - p) * (double)off;        // split the zoom-out, alt vs zoom
+		double denom = (double)z0 + (double)off + B;
+		double zoom = (denom > 1.0) ? ((cam40 + B) / denom) * (double)zoom0 : (double)zoom0;  // keep (cam40+8)  / zoom const
+		if (cam40 > (double)Z_ENGINE_MAX) cam40 = (double)Z_ENGINE_MAX;
+		if (cam40 < 0.0) cam40 = 0.0;
+		int64_t zlo = (int64_t)zoom0 / 8; if (zlo < 1)zlo = 1; int64_t zhi = (int64_t)zoom0 * 2;
+		int64_t zi = (int64_t)llround(zoom); if (zi < zlo)zi = zlo; else if (zi > zhi)zi = zhi;
+		cam[6] = (int32_t)llround(cam40); cam[7] = (int32_t)zi; applied = true;
+
+		double ca = (double)z0 + (double)off + (double)Z_CULL_BIAS, cc = cam40 + (double)Z_CULL_BIAS;
+		if (cc > 1.0) cullRatio = ca / cc;
+		if (g_zoomPerspSnap && g_zoomSnapTick == g_tick) {        // instant A<->B flip, no smoother ramp
+			cam[40] = cam[6]; cam[41] = cam[7]; cam[2] = cam[6]; cam[3] = cam[7];
+			Dbg("[ZOOMSNAP] p=%d%% z0=%d off=%d -> cam40=%d zoom=%d cull=%.2f\n", g_zoomPersp, z0, off, cam[6], cam[7], cullRatio);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { applied = false; cullRatio = 1.0; }
+	int r = oCamCommit(thisp, edx); 
+	if (applied && g_zoomCullFix && cullRatio > 1.0001 && cullRatio < 16.0)
+		__try {
+		int32_t* cam = (int32_t*)thisp;
+		int32_t cx = cam[38], cy = cam[39];
+		int64_t hwx = (int64_t)llround(((int64_t)cam[31] - cam[30]) / 2.0 * cullRatio);
+		int64_t hwy = (int64_t)llround(((int64_t)cam[33] - cam[32]) / 2.0 * cullRatio);
+		int64_t x0 = cx - hwx, x1 = cx + hwx, y0 = cy - hwy, y1 = cy + hwy;
+		const int64_t WMAX = (int64_t)256 << 14;
+		if (x0 < 0)x0 = 0; if (y0 < 0)y0 = 0; if (x1 > WMAX)x1 = WMAX; if (y1 > WMAX)y1 = WMAX;
+		cam[30] = (int32_t)x0; cam[31] = (int32_t)x1; cam[32] = (int32_t)y0; cam[33] = (int32_t)y1;
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
-	return oCamCommit(thisp, edx);
+	return r;
 }
 
 // log stuff
@@ -1126,6 +1321,109 @@ static int32_t  g_camChord[3] = { 0,0,0 };    // this tick's chord (cur-prev)
 static int32_t  g_camPrevVel[3] = { 0,0,0 };    // last tick's chord = velocity entering this keyframe
 static uint32_t g_camVelTick = 0xFFFFFFFFu;
 
+
+// ---- windowed always permitted (getter hook beats the boot race) ----
+typedef char(__cdecl* fn_vidwinallowed_t)();
+static fn_vidwinallowed_t oVidWindowedAllowed = nullptr;
+static char __cdecl Hook_VidWindowedAllowed()
+{
+	if (g_windowMode != 0) return 1;      // Vid_InitScreen zeroed it on 32-bit desktop; override per-call
+	return oVidWindowedAllowed();
+}
+// borderless
+static void ApplyBorderlessStyle()
+{
+	HWND h = *(HWND*)0x673D18;                      // g_hWnd
+	if (!h || !IsWindow(h)) return;
+	int x = 0, y = 0;                              // primary-monitor origin (v1: primary only)
+	SetWindowLongA(h, GWL_STYLE, (LONG)(WS_POPUP | WS_VISIBLE));
+	// cover size = surface size (= g_winW/H), so window == client == backbuffer -> crisp, no stretch
+	SetWindowPos(h, HWND_TOP, x, y, g_winW, g_winH,
+		SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+}
+typedef char(__cdecl* fn_vidsetwindowed_t)();
+static fn_vidsetwindowed_t oVidSetWindowed = nullptr;
+static char __cdecl Hook_VidSetWindowed()
+{
+	char r = oVidSetWindowed();                     // engine stamps WS_CAPTION + creates surface at client size
+	if (r && g_windowMode == 1) ApplyBorderlessStyle();  // re-fires on every resume/alt-tab -> persistent
+	return r;
+}
+// resize and rebuild surface + re-propagate viewport at the new client size ----
+static void ApplyWindowedResize(int w, int h)
+{
+	if (w < 320) w = 320; if (w > 7680) w = 7680;
+	if (h < 240) h = 240; if (h > 4320) h = 4320;
+	if (w == g_winW && h == g_winH) return;
+	g_winW = w; g_winH = h;                          // reg hook now feeds these to Vid_ModeGate
+	*g_pLastViewportDim = -1;                        // force Cameras_SetViewportSize (guard is width-only)
+	g_inVidReconf = true;
+	*(int*)0x673578 = w;   // g_cfgWindowW
+	*(int*)0x6732E8 = h;   // g_cfgWindowH
+
+	((int(__cdecl*)())ADDR_VidReconfigure)();        // CloseScreen -> Vid_SetWindowed(client size) -> new surface
+	((void(__cdecl*)())ADDR_VidReapplyViewport)();   // palettes + Vid_ApplyResolutionToSession (cam[26..29]/[42])
+	g_inVidReconf = false;
+	Dbg("[WIN] resized -> %dx%d\n", w, h);           // Flip_EnsureSize auto-resizes staging+swapchain next render
+}
+
+static bool g_hideCursorWindowed = true;   // "window_hide_cursor" is new
+
+
+//Block the silent exclusive-FS jumps ----
+typedef LRESULT(__stdcall* fn_wndproc_t)(HWND, UINT, WPARAM, LPARAM);
+static fn_wndproc_t oWndProc = nullptr;
+static LRESULT __stdcall Hook_WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	if (g_windowMode != 0) {
+		switch (msg) {
+		case WM_SYSCOMMAND:
+			if ((wParam & 0xFFF0) == SC_MAXIMIZE) return 0;      // engine would -> Vid_SetStartMode(1) = exclusive FS
+			break;
+		case WM_SYSKEYDOWN:
+			if (wParam == VK_RETURN) return 0;                   // Alt+Enter: block exclusive-FS toggle
+			break;
+		case WM_SIZING:                                          // 0x0214 — engine overwrites lParam = PIN
+			if (g_windowMode == 2)
+				return DefWindowProcA(hWnd, msg, wParam, lParam);// let the drag rect through
+			break;
+		case WM_EXITSIZEMOVE:                                    // 0x0232 , engine doesn't handle it
+			if (g_windowMode == 2 && !g_inVidReconf) {
+				RECT rc; GetClientRect(hWnd, &rc);
+				ApplyWindowedResize(rc.right - rc.left, rc.bottom - rc.top);
+				return 0;
+			}
+			break;
+		case WM_SETCURSOR:
+
+			if (g_hideCursorWindowed && LOWORD(lParam) == HTCLIENT && GetForegroundWindow() == hWnd) {
+				SetCursor(nullptr);
+				return TRUE;         // We handled it. So, DefWindowProc never restores the arrow
+			}
+			break;
+		}
+	}
+	return oWndProc(hWnd, msg, wParam, lParam);
+}
+
+// SceneNode pool-full guard: prevent null deref
+static uint32_t g_scratchSceneNode[3] = { 0,0,0 };
+typedef uint32_t* (__fastcall* fn_scnalloc_t)(uint32_t*, void*);
+static fn_scnalloc_t oSceneNodeAlloc = nullptr;
+static uint32_t* __fastcall Hook_SceneNodeAlloc(uint32_t* thisp, void* edx)
+{
+	uint32_t v = thisp[3000];
+	if (v >= 1000) {                                 // pool full: drop overflow safely 
+		static bool warned = false;
+		if (!warned && g_debugLogic) { warned = true; Dbg("[SCENE] node pool full (>1000 visible sprites) — overflow dropped\n"); }
+		return g_scratchSceneNode;
+	}
+	thisp[3000] = v + 1;
+	return &thisp[3 * v];
+}
+static bool           g_busCountReset = true;      // ini "bus_count_reset"
+
+//static bool g_bNoGangMeterBlink = false;
 static void LoadConfig()
 {
 	char path[MAX_PATH]; GetModuleFileNameA(GetModuleHandleA(nullptr), path, MAX_PATH);
@@ -1140,7 +1438,7 @@ static void LoadConfig()
 	g_pumpBudgetMs = (double)GetPrivateProfileIntA("60fps", "pumpbudget", 42, path);
 	if (g_pumpBudgetMs < 20)
 		g_pumpBudgetMs = 42.0;
-	
+
 	g_doObjs = GetPrivateProfileIntA("60fps", "objects", 1, path) != 0;
 	g_doCamera = GetPrivateProfileIntA("60fps", "camera", 1, path) != 0;
 	g_camZ = GetPrivateProfileIntA("60fps", "cameraz", 1, path) != 0;
@@ -1170,7 +1468,7 @@ static void LoadConfig()
 
 	// tiles
 	g_tileListOptimization = GetPrivateProfileIntA("60fps", "tilelist_opt", 1, path) != 0;
-	
+
 
 	g_spawnObjSuppressRenderForTicks = (uint32_t)GetPrivateProfileIntA("60fps", "spawn_object_rendertick_fix_warmup_tick_time", 3, path);
 	g_unifyRes = GetPrivateProfileIntA("60fps", "unifyres", 1, path) != 0;
@@ -1195,10 +1493,13 @@ static void LoadConfig()
 	g_zoomOffset = GetPrivateProfileIntA("60fps", "zoom_offset", 0, path);
 	g_zoomStep = GetPrivateProfileIntA("60fps", "zoom_step", 2048, path);
 	g_zoomMax = GetPrivateProfileIntA("60fps", "zoom_max", 73728, path);
-	if (g_zoomMax > 73728)
-		g_zoomMax = 73728;
+	if (g_zoomMax > 73728) g_zoomMax = 73728;
 	g_zoomMin = GetPrivateProfileIntA("60fps", "zoom_min", 0, path);
 	g_zoomKeys = GetPrivateProfileIntA("60fps", "zoom_keys", 1, path);
+
+	g_zoomPerspAllowTogglingWithNumKeys = GetPrivateProfileIntA("60fps", "zoom_perspective_allow_numkeys_to_toggle", 0, path) != 0;
+	g_zoomPersp = GetPrivateProfileIntA("60fps", "zoom_perspective", 0, path);
+	g_zoomPerspAlt = GetPrivateProfileIntA("60fps", "zoom_perspective_alt", 25, path);
 
 	g_bannerDedup = GetPrivateProfileIntA("60fps", "banner_dedup", 0, path) != 0;
 	g_bannerDedupCar = GetPrivateProfileIntA("60fps", "banner_dedup_car", 0, path) != 0;
@@ -1240,7 +1541,22 @@ static void LoadConfig()
 	g_collectibleCounter = GetPrivateProfileIntA("60fps", "collectible_counter", 0, path) != 0;
 	g_collectibleShowTotal = GetPrivateProfileIntA("60fps", "collectible_show_total", 0, path) != 0;
 	g_collectibleMsgTicks = GetPrivateProfileIntA("60fps", "collectible_msg_ticks", 90, path);
+	g_windowMode = GetPrivateProfileIntA("60fps", "window_mode", 0, path);
+	g_highresScanlineFix = GetPrivateProfileIntA("60fps", "highres_scanline_fix", 1, path) != 0;
+	g_scanlineMax = GetPrivateProfileIntA("60fps", "scanline_max", 1700, path);
+	g_sceneNodeGuard = GetPrivateProfileIntA("60fps", "scenenode_guard", 1, path) != 0;
 
+	// 
+	g_hideCursorWindowed = GetPrivateProfileIntA("60fps", "window_hide_cursor", 1, path) != 0;
+
+	g_hideEndMarkerWhenFurtherThan = GetPrivateProfileIntA("60fps", "hide_endlevel_arrow_when_further_than", 12, path);
+	g_endArrowGraceSeconds = GetPrivateProfileIntA("60fps", "endlevel_arrow_grace_seconds", 25, path);
+	if (g_endArrowGraceSeconds < 0) g_endArrowGraceSeconds = 0;
+	g_bhideEndLevelArrowIf_Far = GetPrivateProfileIntA("60fps", "hide_endlevel_arrow_if_far", 0, path) != 0;
+	
+
+//	g_bNoGangMeterBlink = GetPrivateProfileIntA("60fps", "gangmeter_disable_blink_at_max", 0, path) != 0;
+	g_busCountReset = GetPrivateProfileIntA("60fps", "bus_count_reset", 1, path) != 0;
 }
 static void ForceDirtyNow(int32_t* d)
 {   // clear +72 on both caches NOW, before the draw
@@ -1289,8 +1605,7 @@ struct SavedObj
 };
 static std::vector<SavedObj> g_savedObj;
 
-static uint32_t g_tick = 0;
-static uint32_t g_frame = 0;
+
 
 // ---- diag ----
 static inline bool BadPtr(uintptr_t p)
@@ -1756,12 +2071,24 @@ static int   s_flW = 0, s_flH = 0;
 static bool  s_flReady = false, s_flGrabbed = false, s_flShown = false;
 static volatile LONG s_flDead = 0;
 static uint32_t s_flGrabs = 0, s_flPresents = 0;
+
+//  DXGI hardware-vblank sampling 
+#ifndef DXGI_ERROR_FRAME_STATISTICS_DISJOINT
+#define DXGI_ERROR_FRAME_STATISTICS_DISJOINT _HRESULT_TYPEDEF_(0x887A000BL)
+#endif
+static UINT     g_flSyncRefresh = 0;   // last DXGI SyncRefreshCount (real  display-refresh counter)
+static int64_t  g_flSyncQpc = 0;       // QPC of that refresh's scanout
+static uint32_t g_flHbStatsOk = 0, g_flHbStatsFail = 0;   // per-heartbeat tally 
+static bool     s_flVblankFromStats = false;              // did stats drive the anchor this present?
+
 typedef void(__cdecl* fn_cxx_t)();
 static fn_cxx_t oCxxRestore = nullptr;
-// Per-row copy DD-surface -> mapped staging. Non-temporal stores: the CPU never reads this buffer back
-// (GPU consumes it via CopyResource), so streaming the writes keeps 5-8MB/frame out of the cache.
+// Per-row copy DD-surface -> mapped staging. Non-temporal stores, the CPU never reads this buffer back
+// (GPU consumes it via CopyResource)
+// so streaming the writes keeps 5-8MB/frame out of the cache.
 // _mm_sfence() publishes the weakly-ordered stores before Unmap/GPU read. Falls back to memcpy when
-// alignment doesn't permit movntdq (guards dst base, dst pitch, and rowBytes; src uses unaligned load).
+// alignment doesn't permit movntdq (guards dst base, dst pitch, and rowBytes, src uses unaligned load)
+// Really gotta learn to kepe things simpler, it's 5 AM rofl
 static inline void CopyRowsToStaging(uint8_t* dst, int dstPitch,
 	const uint8_t* src, int srcPitch, int rowBytes, int h)
 {
@@ -1794,7 +2121,7 @@ static void Flip_ReleaseAll()
 	if (s_flCtx) { s_flCtx->Release();     s_flCtx = nullptr; }
 	if (s_flDev) { s_flDev->Release();     s_flDev = nullptr; }
 	s_flW = s_flH = 0; s_flShown = false; s_flGrabbed = false;
-	s_flWaitable = nullptr; 
+	s_flWaitable = nullptr;
 }
 static HWND g_flFoundHwnd = nullptr;
 static BOOL CALLBACK Flip_EnumProc(HWND h, LPARAM)
@@ -1887,12 +2214,22 @@ static bool Flip_Init(HWND hwnd, int w, int h)
 		{   // pacing mechanism without this, Present() never blocks,90fps + tear
 			IDXGISwapChain2* sc2 = nullptr;
 			if (SUCCEEDED(s_flSwap->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&sc2)) && sc2) {
-				sc2->SetMaximumFrameLatency(g_flipLatency);   
+				sc2->SetMaximumFrameLatency(g_flipLatency);
 				s_flWaitable = sc2->GetFrameLatencyWaitableObject();
 				sc2->Release();
 			}
 			if (s_flWaitable) Dbg("[FLIP] waitable acquired — vblank pacing armed\n");
 			else Dbg("[FLIP] WARNING no waitable (QI IDXGISwapChain2 failed) — will tear/90fps\n");
+		}
+		{   // declare SDR full-range, harmless, and stops any downstream limited"assumption on  content
+			IDXGISwapChain3* sc3 = nullptr;
+			if (SUCCEEDED(s_flSwap->QueryInterface(__uuidof(IDXGISwapChain3), (void**)&sc3)) && sc3) {
+				UINT sup = 0;
+				if (SUCCEEDED(sc3->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, &sup))
+					&& (sup & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT))
+					sc3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+				sc3->Release();
+			}
 		}
 		hr = DCompositionCreateDevice(dxdev, __uuidof(IDCompositionDevice), (void**)&s_flDcDev); dxdev->Release();
 		if (FAILED(hr) || !s_flDcDev) { Dbg("[FLIP] DCompositionCreateDevice hr=%08X\n", (unsigned)hr); return false; }
@@ -1901,7 +2238,7 @@ static bool Flip_Init(HWND hwnd, int w, int h)
 		hr = s_flDcDev->CreateVisual(&s_flDcVis);
 		if (FAILED(hr) || !s_flDcVis) { Dbg("[FLIP] CreateVisual hr=%08X\n", (unsigned)hr); return false; }
 		s_flDcVis->SetContent(s_flSwap);
-		s_flDcTgt->SetRoot(nullptr);            
+		s_flDcTgt->SetRoot(nullptr);
 		s_flDcDev->Commit();
 		Dbg("[FLIP] init OK %dx%d hwnd=%p — DComp armed (expect Independent Flip)\n", w, h, hwnd);
 		if (g_flipSuppressEngine) Flip_InstallEngineHijack();   // <<< ADD
@@ -2014,9 +2351,48 @@ static void Flip_Grab()
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+
+// Real vblank anchor from DXGI. SyncQPCTime = QPC of the vblank the last DISPLAYED present latched
+// onto; SyncRefreshCount = the real display-refresh counter. That's a hardware-locked PHASE + GRID,
+// which is exactly what Alpha()'s next-vblank lookahead needs. Replaces "pb after Present == a vblank" false under a latency-2 waitable (the queue depth offsets pb from the true scanout, and the pump's
+// 2nd present per tick drags the pb-interval EMA below 16.67). The grid here is deltaQPC/deltaRefresh,
+// so it's immune to how often we present. Fails cleanly -> pb fallback in Hook_Render takes over.
+static bool Flip_SampleVblank()
+{
+	if (!s_flSwap || !g_qpf.QuadPart) { ++g_flHbStatsFail; return false; }
+	__try {
+		DXGI_FRAME_STATISTICS st = {};
+		HRESULT hr = s_flSwap->GetFrameStatistics(&st);
+		if (hr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
+			g_flSyncRefresh = 0; g_flSyncQpc = 0;      // mode/composition change -> re-baseline next good sample
+			++g_flHbStatsFail; return false;
+		}
+		if (FAILED(hr) || !st.SyncQPCTime.QuadPart || !st.SyncRefreshCount) {
+			++g_flHbStatsFail; return false;           // composited / not yet live -> no scanout data
+		}
+		if (st.SyncRefreshCount != g_flSyncRefresh) {
+			// derive refreshMs from REAL refreshes between two good samples (pump-immune)
+			if (g_flSyncRefresh && st.SyncRefreshCount > g_flSyncRefresh
+				&& st.SyncQPCTime.QuadPart > g_flSyncQpc) {
+				double per = (double)(st.SyncQPCTime.QuadPart - g_flSyncQpc) * 1000.0 / (double)g_qpf.QuadPart
+					/ (double)(st.SyncRefreshCount - g_flSyncRefresh);
+				if (per > 5.0 && per < 25.0) g_refreshMs = g_refreshMs * 0.9 + per * 0.1;
+			}
+			g_flSyncRefresh = st.SyncRefreshCount;
+			g_flSyncQpc = st.SyncQPCTime.QuadPart;
+		}
+		g_lastVblankQpc = st.SyncQPCTime.QuadPart;     // the anchor nvba interpolates toward
+		g_haveVblank = true;
+		s_flVblankFromStats = true;
+		++g_flHbStatsOk;
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { ++g_flHbStatsFail; return false; }
+}
 // called from Hook_Render, AFTER oRender() (engine's own flip already paced us to vsync)
 static void Flip_Present()
 {
+	s_flVblankFromStats = false;    // reset every present, SampleVblank sets it true on success
 	if (!s_flReady || s_flDead || !s_flGrabbed || !s_flSwap) return;
 	ID3D11Texture2D* stg = s_flStaging[s_flStageCur];
 	if (!stg) return;
@@ -2041,6 +2417,7 @@ static void Flip_Present()
 			Dbg("[FLIP] Present hr=%08X -> permanent fallback to engine present\n", (unsigned)hr);
 			InterlockedExchange(&s_flDead, 1); Flip_Hide(); return;
 		}
+		Flip_SampleVblank();          // real DXGI vblank anchor + refreshMs grid (drives nvba)
 		if (!s_flShown) Flip_Show();
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -2103,12 +2480,44 @@ static void BannerDedupReset()
 {
 	g_dedupArea.seen.clear(); g_dedupArea.curEpisode.clear(); g_dedupArea.curSuppressed = false;
 	g_dedupCar.seen.clear();  g_dedupCar.curEpisode.clear();  g_dedupCar.curSuppressed = false;
-	if(g_debugLogic)
+	if (g_debugLogic)
 		Dbg("[60] banner dedup: sets cleared (level start)\n");
 }
+/// fixing one vanilla crash and one mod crash
+static uint8_t* const g_pBusRouteNodeCount = (uint8_t*)0x66BB49;
+static const int      kBusRouteNodeCap = 100;
+
+static volatile bool  g_sessionLive = false;
+static uint32_t       g_lastPumpTick = 0xFFFFFFFFu;
+static void Mod_ResetSessionState(const char* why)
+{
+	size_t o = g_obj.size(), d = g_dead.size(), m = g_moved.size(), ar = g_arrow.size();
+	g_obj.clear();
+	g_dead.clear();
+	g_moved.clear();
+	g_savedObj.clear();
+	g_live.clear();
+	g_liveVec.clear();
+	g_arrow.clear();
+	g_tiles.clear();
+	if (++g_tileGen == 0) { memset(g_tileStamp, 0, sizeof g_tileStamp); g_tileGen = 1; }
+	memset(g_camChord, 0, sizeof g_camChord);
+	memset(g_camPrevVel, 0, sizeof g_camPrevVel);
+	g_camVelTick = 0xFFFFFFFFu;
+	g_savedRectValid = false;
+	g_lastPumpTick = 0xFFFFFFFFu;
+	g_havePA = false;
+	g_pedKind = -1; g_pedTries = 0;
+	g_lastObj = nullptr;
+
+	Dbg("[SESS] reset (%s): dropped objs=%zu dead=%zu moved=%zu arrows=%zu\n", why, o, d, m, ar);
+}
+
 static char* __fastcall Hook_LevelStart(void* thisp, void* edx)
 {
 	Dbg("[Level] Level Start\n");
+	g_endArrowReached = false;
+	g_endArrowReachTick = 0;
 	static bool s_surfOnce = false;
 	if (g_surfClawback && !s_surfOnce) {
 		s_surfOnce = true;
@@ -2127,14 +2536,26 @@ static char* __fastcall Hook_LevelStart(void* thisp, void* edx)
 	}
 	if (g_bannerDedup || g_bannerDedupCar) BannerDedupReset();
 	if (g_audioWarmUp) StartAudioWarm();
-	return oLevelStart(thisp, edx);
+	uint8_t busBefore = *g_pBusRouteNodeCount;
+	if (g_busCountReset) *g_pBusRouteNodeCount = 0;    // fresh transitMgr we ensure it's fresh count
+	char* r = oLevelStart(thisp, edx);                 // Transit_SpawnFromZones refills it here
+	uint8_t busAfter = *g_pBusRouteNodeCount;
+	if (g_busCountReset && busAfter > kBusRouteNodeCap) {
+		*g_pBusRouteNodeCount = (uint8_t)kBusRouteNodeCap;   // never let the bus scan walk off the block
+	}
+	Dbg("[BUS] route nodes before=%u after=%u cap=%d%s\n", busBefore, busAfter, kBusRouteNodeCap,
+		busAfter > kBusRouteNodeCap ? "  *** map exceeds cap, clamped ***" : "");
+	return r;
 }
 
 static char* __cdecl Hook_SessionTeardown()
 {
 	Dbg("[Level] Level End/Game Quit?\n");
-	Flip_Hide();                       //  reveal engine content so the menu isn't under a stale frame
-	return oSessionTeardown();
+	g_sessionLive = false;             // stop render nterp before pools die
+	Flip_Hide();                       // reveal engine content so the menu isn't under a stale frame
+	char* r = oSessionTeardown();      // pools freed here (Hook_Dtor floods g_dead)
+	Mod_ResetSessionState("teardown"); // wipe after the dtors ran
+	return r;
 }
 // ---------- goal 1: banner shrink (scale-about-center) ----------
 static void BannerBegin(int cyInt)
@@ -2238,49 +2659,56 @@ static int __fastcall Hook_Slots(void* thisp, void* edx)
 	struct { int32_t* s; int32_t x, y; } touched[17];
 	int   nTouched = 0;
 	float al = Alpha();
-	for (int i = 0; i < 17; i++)
+	__try
 	{
-		int32_t* s = (int32_t*)((char*)thisp + (size_t)124 * i);
-		if (BadPtr((uintptr_t)s)) continue;                   // guard BEFORE the read, not just __except
-		uint8_t  en; int32_t liveX, liveY;
-		__try { en = *((uint8_t*)s + 45); liveX = s[0]; liveY = s[1]; }
-		__except (EXCEPTION_EXECUTE_HANDLER) { continue; }
-		if (!en) {                                    // disabled: arm snap for the re-enable edge
-			auto it = g_arrow.find(s);
-			if (it != g_arrow.end()) it->second.wasEn = false;
-			continue;
-		}
-		ArrowState& a = g_arrow[s];
-		if (a.tick != g_tick) {                       // first render of a new tick: shift cur->prev
-			a.px = a.cx; a.py = a.cy;
-			a.cx = liveX; a.cy = liveY;
-			a.tick = g_tick;
-		}
-		else {                                      // pumped render, same tick: value must match
-			if ((liveX != a.cx || liveY != a.cy) && g_arrowWarn < 20) {
-				++g_arrowWarn;
-				if(g_debugLogic)
-					Dbg("[ARW] per-render write?! i=%d tick=%u wasX=%d nowX=%d\n", i, g_tick, a.cx, liveX);
+		for (int i = 0; i < 17; i++)
+		{
+			int32_t* s = (int32_t*)((char*)thisp + (size_t)124 * i);
+			if (BadPtr((uintptr_t)s)) continue;                   // guard BEFORE the read, not just __except
+			uint8_t  en; int32_t liveX, liveY;
+			en = *((uint8_t*)s + 45); liveX = s[0]; liveY = s[1];
+			if (!en) {                                    // disabled: arm snap for the re-enable edge
+				auto it = g_arrow.find(s);
+				if (it != g_arrow.end()) it->second.wasEn = false;
+				continue;
 			}
-			a.cx = liveX; a.cy = liveY;
-		}
-		if (!a.wasEn) { a.px = liveX; a.py = liveY; }  // enable edge: snap (prev is stale)
-		if (llabs((int64_t)a.cx - a.px) > g_arrowSnap ||
-			llabs((int64_t)a.cy - a.py) > g_arrowSnap) {
-			a.px = a.cx; a.py = a.cy;
-		}  // retarget/wrap: snap
-		a.wasEn = true;
-		int32_t lx = a.px + (int32_t)llround((double)(a.cx - a.px) * al);
-		int32_t ly = a.py + (int32_t)llround((double)(a.cy - a.py) * al);
-		__try {
+			ArrowState& a = g_arrow[s];
+			if (a.tick != g_tick) {                       // first render of a new tick: shift cur->prev
+				a.px = a.cx; a.py = a.cy;
+				a.cx = liveX; a.cy = liveY;
+				a.tick = g_tick;
+			}
+			else {                                      // pumped render, same tick: value must match
+				if ((liveX != a.cx || liveY != a.cy) && g_arrowWarn < 20) {
+					++g_arrowWarn;
+					if (g_debugLogic)
+						Dbg("[ARW] per-render write?! i=%d tick=%u wasX=%d nowX=%d\n", i, g_tick, a.cx, liveX);
+				}
+				a.cx = liveX; a.cy = liveY;
+			}
+			if (!a.wasEn) { a.px = liveX; a.py = liveY; }  // enable edge: snap (prev is stale)
+			if (llabs((int64_t)a.cx - a.px) > g_arrowSnap ||
+				llabs((int64_t)a.cy - a.py) > g_arrowSnap) {
+				a.px = a.cx; a.py = a.cy;
+			}  // retarget/wrap: snap
+			a.wasEn = true;
+			int32_t lx = a.px + (int32_t)llround((double)(a.cx - a.px) * al);
+			int32_t ly = a.py + (int32_t)llround((double)(a.cy - a.py) * al);
+
 			s[0] = lx; s[1] = ly;
 			touched[nTouched].s = s; touched[nTouched].x = liveX; touched[nTouched].y = liveY; ++nTouched;
+
 		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {}
 	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
 	int r = oSlots(thisp, edx);
-	for (int i = 0; i < nTouched; i++)
-		__try { touched[i].s[0] = touched[i].x; touched[i].s[1] = touched[i].y; }
+	__try
+	{
+		for (int i = 0; i < nTouched; i++)
+		{
+			touched[i].s[0] = touched[i].x; touched[i].s[1] = touched[i].y;
+		}
+	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
 	return r;
 }
@@ -2322,7 +2750,7 @@ static int __fastcall Hook_Pos(void* thisp, void* edx, int x, int y, int z)
 		if (g_reentryLog < 50)
 		{
 			g_reentryLog++;
-			if(g_debugLogic)
+			if (g_debugLogic)
 				Dbg("[60] !! setter DURING render this=%p ra=%p\n", thisp, _ReturnAddress());
 		}
 		return oPos(thisp, edx, x, y, z);
@@ -2348,17 +2776,77 @@ static int __fastcall Hook_Pos(void* thisp, void* edx, int x, int y, int z)
 	}
 	return oPos(thisp, edx, x, y, z);
 }
+
+static void PostCenteredText(const wchar_t* text, int ticks)
+{
+	__try {
+		if (!g_pHud) return;
+		uintptr_t hud = *(uintptr_t*)g_pHud;
+		if (hud < 0x10000 || hud > 0x7FFFFFFF) return;
+		uint8_t* slot = (uint8_t*)(hud + 10168);           // CenteredText1
+		int t = ticks; if (t < 1) t = 1; if (t > 255) t = 255;
+		slot[0] = (uint8_t)t;                              // display timer
+		lstrcpynW((wchar_t*)(slot + 2), text, 60);
+		Hud_LayoutCenteredText1_fn(slot, nullptr);         // centered width -> +132
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 static char __cdecl Hook_Logic()
 {
 	CP(10);
 	++g_tick;
+	
+/*	if (GetAsyncKeyState(VK_RCONTROL) & 0x8000)
+	{
+		wchar_t text[64];
+		
+		int iScore = GetPlayerScore();
+
+		if (*(uintptr_t*)ADDR_pMissionState != 0)
+		{
+			int iScoreMax = *((*(uintptr_t**)ADDR_pMissionState) + 196);
+
+			_snwprintf(text, 63, L"%d score / %d",
+				iScore, iScoreMax);
+			text[63] = 0;
+			PostCenteredText(text, 75);
+		}
+
+	}*/
+	
+
 	if (g_zoom) {
-		int vkOut = g_zoomKeys ? VK_OEM_MINUS : VK_SUBTRACT;  // minus = zoom OUT = raise cam
-		int vkIn = g_zoomKeys ? VK_OEM_PLUS : VK_ADD;       // plus  = zoom IN
+		int vkOut = g_zoomKeys ? VK_OEM_MINUS : VK_SUBTRACT;
+		int vkIn = g_zoomKeys ? VK_OEM_PLUS : VK_ADD;
 		if (GetAsyncKeyState(vkOut) & 0x8000) g_zoomOffset += g_zoomStep;
 		if (GetAsyncKeyState(vkIn) & 0x8000) g_zoomOffset -= g_zoomStep;
 		if (g_zoomOffset > g_zoomMax) g_zoomOffset = g_zoomMax;
 		if (g_zoomOffset < g_zoomMin) g_zoomOffset = g_zoomMin;
+		if (g_zoomPerspKey && g_zoomPerspAllowTogglingWithNumKeys) {                                   
+		// just failed experiment, i should probably just remove this, 
+		// num2: A<->alt preset
+			static bool pk = false; bool d = (GetAsyncKeyState(g_zoomPerspKey) & 0x8000) != 0;
+			if (d && !pk) {
+				int t = g_zoomPersp; g_zoomPersp = g_zoomPerspAlt; g_zoomPerspAlt = t;
+				g_zoomSnapTick = g_tick;
+				Dbg("[ZOOM] perspective=%d%% (%s)\n", g_zoomPersp,
+					g_zoomPersp <= 0 ? "flat/A" : g_zoomPersp >= 100 ? "splay/B" : "blend");
+			}
+			pk = d;
+		}
+		if (g_zoomPerspStep && g_zoomPerspAllowTogglingWithNumKeys) {                                  // num1/num3: nudge live
+			static bool pd = false, pu = false;
+			bool dn = (GetAsyncKeyState(g_zoomPerspDnKey) & 0x8000) != 0;
+			bool up = (GetAsyncKeyState(g_zoomPerspUpKey) & 0x8000) != 0;
+			if ((dn && !pd) || (up && !pu)) {
+				g_zoomPersp += up ? g_zoomPerspStep : -g_zoomPerspStep;
+				if (g_zoomPersp < 0) g_zoomPersp = 0; if (g_zoomPersp > 100) g_zoomPersp = 100;
+				g_zoomSnapTick = g_tick;          // <-- ADD: snap, no ramp-wobble while dialing
+				Dbg("[ZOOMPERSP] %d%%\n", g_zoomPersp);
+			}
+			pd = dn; pu = up;
+		}
 	}
 
 	{
@@ -2390,6 +2878,16 @@ static char __cdecl Hook_Logic()
 	CP(11);
 	char r = oLogic();
 	CP(12);
+	g_sessionLive = true;              // first tick of this session done -> g_moved is trustworthy
+	// end-level arrow grace: detect score>=max rising edge, anchor the countdown
+	if (g_bhideEndLevelArrowIf_Far && g_hideEndMarkerWhenFurtherThan > 0 && g_endArrowGraceSeconds > 0)
+	{
+		int scoreMax = GetScoreMax();
+		bool reached = (scoreMax > 0 && GetPlayerScore() >= scoreMax);
+		if (reached && !g_endArrowReached)
+			g_endArrowReachTick = g_tick;   // estart the grace clock on the rising edge
+		g_endArrowReached = reached;
+	}
 	if (g_doObjs && (g_tick % 300) == 0)
 	{
 		for (auto it = g_obj.begin(); it != g_obj.end(); )
@@ -2404,11 +2902,13 @@ static char __cdecl Hook_Logic()
 	if ((g_tick % 30) == 0)
 	{
 		if (g_flipPresent && g_debugLogic)
-			Dbg("[FLIP] ready=%d shown=%d dead=%d grabs=%u pres=%u %dx%d | grabEMA=%.2f grabMAX=%.2f presentEMA=%.2f waitEMA=%.2f ring=%d\n",
+			Dbg("[FLIP] ready=%d shown=%d dead=%d grabs=%u pres=%u %dx%d | grabEMA=%.2f grabMAX=%.2f presentEMA=%.2f waitEMA=%.2f ring=%d | stats ok=%u fail=%u refresh=%.3f\n",
 				(int)s_flReady, (int)s_flShown, (int)s_flDead, s_flGrabs, s_flPresents, s_flW, s_flH,
-				g_grabMsEma, g_grabMsMax, g_presentMsEma, g_waitMsEma, g_flStageRingN);
+				g_grabMsEma, g_grabMsMax, g_presentMsEma, g_waitMsEma, g_flStageRingN,
+				g_flHbStatsOk, g_flHbStatsFail, g_refreshMs);
 		s_flGrabs = 0; s_flPresents = 0;
 		g_grabMsMax = 0.0;
+		g_flHbStatsOk = 0; g_flHbStatsFail = 0;
 
 		if (g_debugLogic)
 			Dbg("[60] tick#%u moved=%zu objs=%zu carLive=%d carMiss=%u dtor=%u deadN=%zu dualw=%u a=%.2f\n",
@@ -2455,7 +2955,7 @@ static char __cdecl Hook_Logic()
 				double mA = g_dASum / g_dAN, vA = g_dASumSq / g_dAN - mA * mA; if (vA < 0) vA = 0;
 				double mS = g_csN ? g_csSum / g_csN : 0.0, vS = g_csN ? g_csSumSq / g_csN - mS * mS : 0.0; if (vS < 0) vS = 0;
 				double mL = g_latN ? g_latSum / g_latN : 0.0, vL = g_latN ? g_latSumSq / g_latN - mL * mL : 0.0; if (vL < 0) vL = 0;
-				double cv = mS > 1.0 ? sqrt(vS) / mS : 0.0; 
+				double cv = mS > 1.0 ? sqrt(vS) / mS : 0.0;
 				Dbg("[PERF6] nvba=%d refresh=%.2f sc=%.1f | dA m=%.3f[%.3f..%.3f]sd=%.3f | camStep(t) m=%.4f sd=%.4f CV=%.2f | lat m=%.1f[%.1f..%.1f]sd=%.2f n=%u\n",
 					(int)g_nextVblankAlpha, g_refreshMs, g_sceneQPCema,
 					mA, g_dAMin, g_dAMax, sqrt(vA),
@@ -2513,7 +3013,7 @@ static char __cdecl Hook_Render()
 	++g_frame;
 	if (g_logEnabled && g_frame == 5)
 	{   // fire early so a quick quit still captures env
-		if(g_debugLogic)
+		if (g_debugLogic)
 			Dbg("[ENV] screen=%dx%d\n", GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
 		EnumWindows(EnumWndProc, 0);
 	}
@@ -2579,7 +3079,7 @@ static char __cdecl Hook_Render()
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
 	CP(21);
 	g_savedObj.clear();
-	if (g_doObjs)
+	if (g_doObjs && g_sessionLive)     // never touch disps before this session's first tick
 	{
 		g_extraInterp = 0;
 		memset(g_kindSeen, 0, sizeof g_kindSeen);
@@ -2633,7 +3133,7 @@ static char __cdecl Hook_Render()
 					++g_missCount;
 					if ((g_missCount % 400) == 1)
 					{
-						if(g_debugLogic)
+						if (g_debugLogic)
 							Dbg("[MISS] persistent mover NEVER live d=%p moves=%u cur=(%d,%d)\n", d, s.moves, s.cx, s.cy);
 					}
 				}
@@ -2690,7 +3190,7 @@ static char __cdecl Hook_Render()
 				static int n = 0;
 				if (n++ < 50)
 				{
-					if(g_debugLogic)
+					if (g_debugLogic)
 						Dbg("[SEH] dead obj on WRITE d=%p tick=%u\n", d, g_tick);
 				}
 			}
@@ -2705,11 +3205,17 @@ static char __cdecl Hook_Render()
 	LARGE_INTEGER pb; QueryPerformanceCounter(&pb);   // pb AFTER the real present/vblank (same semantics as before)
 	double pres = (double)(pb.QuadPart - pa.QuadPart) * 1000.0 / (double)g_qpf.QuadPart;
 	g_presentQPCema = g_presentQPCema * 0.9 + pres * 0.1;
-	if (g_haveVblank) {
-		double iv = (double)(pb.QuadPart - g_lastVblankQpc) * 1000.0 / (double)g_qpf.QuadPart;
-		if (iv > 5.0 && iv < 25.0) g_refreshMs = g_refreshMs * 0.9 + iv * 0.1;
+	// nvba anchor/grid: prefer the hardware vblank sampled in Flip_SampleVblank (phase and refreshMs,
+	// immune to present frequency). Only when DXGI stats are unavailable — no presenter, kicked to DWM
+	// composition or disjoint — fall back to pb a vblnak thing (contaminated by the pump,
+	// but it's all we've got on that path).
+	if (!s_flVblankFromStats) {
+		if (g_haveVblank) {
+			double iv = (double)(pb.QuadPart - g_lastVblankQpc) * 1000.0 / (double)g_qpf.QuadPart;
+			if (iv > 5.0 && iv < 25.0) g_refreshMs = g_refreshMs * 0.9 + iv * 0.1;
+		}
+		g_lastVblankQpc = pb.QuadPart; g_haveVblank = true;
 	}
-	g_lastVblankQpc = pb.QuadPart; g_haveVblank = true;
 
 	if (g_debugLogic) {   // phase/judder stats only when logging
 		double lat = (double)(pb.QuadPart - qComposeStart.QuadPart) * 1000.0 / (double)g_qpf.QuadPart;
@@ -2758,7 +3264,6 @@ static char __cdecl Hook_Render()
 	g_lastPresentCPU = g_lastPresentCPU * 0.6 + (double)rd * 0.4;   // <-- feeds the pump gate (FULL present cost, incl BitBlt/flip)
 	return r;
 }
-static uint32_t g_lastPumpTick = 0xFFFFFFFFu;   // file scope
 
 static char __cdecl Hook_Tick()
 {
@@ -2829,22 +3334,34 @@ static fn_reggetint_t oRegGetInt = nullptr;
 static int __stdcall Hook_RegGetInt(const char* name, int def)
 {
 	if (name) {
-		if (g_resWidth > 0 && g_resHeight > 0) {
+		if (g_skipIntro && !_stricmp(name, "do_play_movie")) return 0;
+		if (g_windowMode != 0) {
+			if (!_stricmp(name, "start_mode"))     return 0;        // force the windowed path
+			if (!_stricmp(name, "window_width"))   return g_winW;   // live client size
+			if (!_stricmp(name, "window_height"))  return g_winH;
+		}
+		if (g_resWidth > 0 && g_resHeight > 0) {                    // legacy exclusive-FS high-res override
 			if (!_stricmp(name, "full_width") || !_stricmp(name, "window_width"))  return g_resWidth;
 			if (!_stricmp(name, "full_height") || !_stricmp(name, "window_height")) return g_resHeight;
 		}
-		if (g_skipIntro && !_stricmp(name, "do_play_movie")) return 0;  // WinMain: !=1 => v12=0 => straight to menu
 	}
 	return oRegGetInt(name, def);
 }
-
+static bool ResIsRealDisplayMode(int w, int h)
+{
+	DEVMODEA dm = {}; dm.dmSize = sizeof dm;
+	for (int i = 0; EnumDisplaySettingsA(nullptr, i, &dm); ++i)
+		if ((int)dm.dmPelsWidth == w && (int)dm.dmPelsHeight == h && dm.dmBitsPerPel >= 32)
+			return true;
+	return false;
+}
 static void ValidateConfig()
 {
 
-	if (!g_bApply32bpp)
-	{
-		if (g_flipPresent) { g_flipPresent = false; Dbg("[CFG] flip_present needs 32bit_mode=1 -> OFF\n"); }
-		if (g_surfClawback) { g_surfClawback = false; Dbg("[CFG] surf_clawback needs 32bit_mode=1 -> OFF\n"); }
+	bool surface32 = g_bApply32bpp || (g_windowMode != 0);   // windowed surface = desktop format = 32-bit
+	if (!surface32) {
+		if (g_flipPresent) { g_flipPresent = false;  Dbg("[CFG] flip_present needs 32bit (exclusive) -> OFF\n"); }
+		if (g_surfClawback) { g_surfClawback = false; Dbg("[CFG] surf_clawback needs 32bit (exclusive) -> OFF\n"); }
 	}
 	// flip_* sub-knobs do nothing without the presenter -- nudge once, don't fight the user.
 	if (!g_flipPresent &&
@@ -2865,21 +3382,51 @@ static void ValidateConfig()
 	if (g_zoomOffset < g_zoomMin) g_zoomOffset = g_zoomMin;
 	// only 60 is actually tested; keep capfps out of the absurd (crash-safe either way)
 	if (g_capFps > 240.0) { Dbg("[CFG] capfps clamped to 240\n"); g_capFps = 240.0; }
+
+	if (g_windowMode < 0 || g_windowMode > 2) g_windowMode = 0;
+	if (g_scanlineMax < 480)  g_scanlineMax = 480;
+	if (g_scanlineMax > 1700) g_scanlineMax = 1700;   // hard cap = real dword_E43F40 capacity
+	// pick the target client size up-front (reg hook feeds it to Vid_ModeGate)
+	if (g_windowMode == 1) {          // borderless, fill primary monitor (res_* overrides for downsample)
+		g_winW = g_resWidth > 0 ? g_resWidth : GetSystemMetrics(SM_CXSCREEN);
+		g_winH = g_resHeight > 0 ? g_resHeight : GetSystemMetrics(SM_CYSCREEN);
+	}
+	else if (g_windowMode == 2) {   // windowed: res_* or a sane default
+		g_winW = g_resWidth > 0 ? g_resWidth : 1280;
+		g_winH = g_resHeight > 0 ? g_resHeight : 960;
+	}
+	if (g_winW < 320) g_winW = 320;  if (g_winW > 7680) g_winW = 7680;
+	if (g_winH < 240) g_winH = 240;  if (g_winH > 4320) g_winH = 4320;
+	if (g_windowMode) Dbg("[WIN] window_mode=%d target=%dx%d\n", g_windowMode, g_winW, g_winH);
+
+	// Exclusive FS can only  use an enumerated display mode. A bogus one (e.g. 1290x900)
+	// -> Vid_CheckMode fails -> 640 fallback leaves surface+72/76/80/84 stale ->
+	// frontend D3D-init (nvd3dum AV) or intro Bink BinkCopyToBuffer (binkw32 AV) writes OOB.
+	if (g_windowMode == 0 && g_resWidth > 0 && g_resHeight > 0
+		&& !ResIsRealDisplayMode(g_resWidth, g_resHeight)) {
+		Dbg("[CFG] %dx%d is NOT a hardware display mode -> exclusive FS would crash. "
+			"Override DROPPED. Use window_mode=1 (borderless) for arbitrary res.\n",
+			g_resWidth, g_resHeight);
+		g_resWidth = 0; g_resHeight = 0;
+	}
+
+	if (g_zoomPersp < 0) g_zoomPersp = 0;        if (g_zoomPersp > 100) g_zoomPersp = 100;
+	if (g_zoomPerspAlt < 0) g_zoomPerspAlt = 0;  if (g_zoomPerspAlt > 100) g_zoomPerspAlt = 100;
 }
 static void Init()
 {
-	LoadConfig(); 
+	LoadConfig();
 	if (g_logEnabled) { LogOpen(); LogInitRing(); }
 	ValidateConfig();
 
-// broken currently
-//	{
-//		ModFlags mf{ &g_bApply32bpp, &g_menuScale, &g_skipIntro, &g_unifyRes, &g_zoom,
-//					 &g_doCamera, &g_childProfile, &g_mapProfile, &g_resWidth, &g_resHeight };
-//		Compat_Run(mf, g_wsCompat);
-//	}
+	// broken currently
+	//	{
+	//		ModFlags mf{ &g_bApply32bpp, &g_menuScale, &g_skipIntro, &g_unifyRes, &g_zoom,
+	//					 &g_doCamera, &g_childProfile, &g_mapProfile, &g_resWidth, &g_resHeight };
+	//		Compat_Run(mf, g_wsCompat);
+	//	}
 
-	if(g_bApply32bpp)
+	if (g_bApply32bpp)
 		Patch32bppMode();
 
 	AddVectoredExceptionHandler(1, Veh);
@@ -2900,7 +3447,9 @@ static void Init()
 	Dbg("[FLIP] flip_present=%d vsync=%d suppress_engine=%d log=%d staging_ring=%d (needs 32bit_mode=%d)\n",
 		(int)g_flipPresent, (int)g_flipVsync, (int)g_flipSuppressEngine,
 		(int)g_flipLog, g_flStageRingN, (int)g_bApply32bpp);
-	
+	Dbg("[ZOOM] enabled=%d perspective=%d%% (alt=%d%%) off=%d step=%d max=%d min=%d keys=%s\n",
+		(int)g_zoom, g_zoomPersp, g_zoomPerspAlt, g_zoomOffset, g_zoomStep, g_zoomMax, g_zoomMin,
+		g_zoomKeys ? "-/=" : "numpad +/-");
 	timeBeginPeriod(1);
 	QueryPerformanceFrequency(&g_qpf);
 	if (g_mapProfile)
@@ -2926,7 +3475,7 @@ static void Init()
 	g_dead.reserve(4096);
 
 	// log any stall that occurs
-	if(g_Watchdog)
+	if (g_Watchdog)
 		CreateThread(nullptr, 0, Watchdog, nullptr, 0, nullptr);
 
 	if (MH_Initialize() != MH_OK)
@@ -2965,9 +3514,19 @@ static void Init()
 			(void**)&o_FrontendLoadMenuBgImages) != MH_OK)
 			Dbg("[60] hook FrontendLoadMenuBgImages FAILED\n");
 	}
-	if (g_skipIntro || (g_resWidth > 0 && g_resHeight > 0))
+	// reg hook now also needed for window_mode (start_mode / window size)
+	if (g_skipIntro || (g_resWidth > 0 && g_resHeight > 0) || g_windowMode != 0)
 		if (MH_CreateHook((void*)0x4B5660, (void*)&Hook_RegGetInt, (void**)&oRegGetInt) != MH_OK)
 			Dbg("[60] hook Registry_GetInt FAILED\n");
+	if (g_windowMode != 0) {
+		if (MH_CreateHook((void*)ADDR_VidWindowedAllowed, (void*)&Hook_VidWindowedAllowed, (void**)&oVidWindowedAllowed) != MH_OK) Dbg("[WIN] hook WindowedAllowed FAILED\n");
+		if (MH_CreateHook((void*)ADDR_VidSetWindowed, (void*)&Hook_VidSetWindowed, (void**)&oVidSetWindowed) != MH_OK) Dbg("[WIN] hook SetWindowed FAILED\n");
+		if (MH_CreateHook((void*)ADDR_GameWndProc, (void*)&Hook_WndProc, (void**)&oWndProc) != MH_OK) Dbg("[WIN] hook WndProc FAILED\n");
+	}
+	if (g_sceneNodeGuard)
+		if (MH_CreateHook((void*)0x4C4B40, (void*)&Hook_SceneNodeAlloc, (void**)&oSceneNodeAlloc) != MH_OK)
+			Dbg("[SCENE] hook SceneNodePool_Alloc FAILED\n");
+
 	if (MH_CreateHook((void*)g.tick, (void*)&Hook_Tick, (void**)&oTick) != MH_OK) Dbg("[60] hook tick FAILED\n");
 	if (MH_CreateHook((void*)g.render, (void*)&Hook_Render, (void**)&oRender) != MH_OK) Dbg("[60] hook render FAILED\n");
 	if (MH_CreateHook((void*)g.logic, (void*)&Hook_Logic, (void**)&oLogic) != MH_OK) Dbg("[60] hook logic FAILED\n");
@@ -3006,6 +3565,13 @@ static void Init()
 		if (MH_CreateHook((void*)g.slots, (void*)&Hook_Slots, (void**)&oSlots) != MH_OK)
 			Dbg("[60] hook slots(arrows) FAILED\n");
 	}
+
+	if (g_hideEndMarkerWhenFurtherThan > 0)
+	{
+		if (MH_CreateHook((void*)g.slotsOne, (void*)&Hook_SlotsOne, (void**)&oDrawOne) != MH_OK)
+			Dbg("[60] hook slotsOne(arrows) FAILED\n");
+	}
+
 	if (g_zoom)
 	{
 		if (MH_CreateHook((void*)g.camcommit, (void*)&Hook_CamCommit, (void**)&oCamCommit) != MH_OK)
@@ -3022,7 +3588,7 @@ static void Init()
 		if (MH_CreateHook((void*)g.drawSprite, (void*)&Hook_DrawSprite, (void**)&oDrawSprite) != MH_OK) Dbg("[60] hook drawSprite FAILED\n");
 		if (MH_CreateHook((void*)g.drawScaledStr, (void*)&Hook_DrawScaledStr, (void**)&oDrawScaledStr) != MH_OK) Dbg("[60] hook drawScaledStr FAILED\n");
 	}
-	
+
 	if (MH_CreateHook((void*)g.levelStart, (void*)&Hook_LevelStart, (void**)&oLevelStart) != MH_OK) Dbg("[60] hook levelStart FAILED\n");
 
 
@@ -3032,12 +3598,51 @@ static void Init()
 		Dbg("[60] enable FAILED\n");
 	Dbg("[60] hooks armed\n");
 
+
+	// im lazy and im setting speed of text messages in-game here:
+	DWORD o;
+	VirtualProtect((void*)0x4C6DC3, 64, PAGE_EXECUTE_READWRITE, &o);
+	memset((void*)0x4C6DC3, 0x90, 12);
+
+	unsigned char* magic = (unsigned char*)0x4C6DCF;
+	magic[0] = 0xB8;
+	magic[1] = 0x01;
+	magic[2] = 0x00;
+	magic[3] = 0x00;
+	magic[4] = 0x00;
+	VirtualProtect((void*)0x4C6DC3, 64, o, &o);
+/*
+	if (g_bNoGangMeterBlink)
+	{
+		// fix blinking annoying thing:
+		VirtualProtect((void*)0x4C751E, 64, PAGE_EXECUTE_READWRITE, &o);
+
+		unsigned char* magic2 = (unsigned char*)0x4C751C;
+		magic2[1] = 0xC0;
+		VirtualProtect((void*)0x4C751E, 64, o, &o);
+		//
+	}
+	*/
 	LogLaunchEnv();
 }
+ 
+static bool IsTargetProcess()
+{
+	wchar_t path[MAX_PATH];
+	DWORD len = GetModuleFileNameW(NULL, path, MAX_PATH);
 
+	if (len == 0 || len == MAX_PATH)
+		return false;
+
+	const wchar_t* name = wcsrchr(path, L'\\');
+	name = name ? name + 1 : path;
+
+	return _wcsicmp(name, L"gta2.exe") == 0 ||
+		_wcsicmp(name, L"gta.exe") == 0;
+}
 BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID)
 {
-	if (r == DLL_PROCESS_ATTACH)
+	if (r == DLL_PROCESS_ATTACH && IsTargetProcess())
 	{
 		DisableThreadLibraryCalls(h);
 		CreateThread(nullptr, 0, [](LPVOID)->DWORD { Init(); return 0; }, nullptr, 0, nullptr);
