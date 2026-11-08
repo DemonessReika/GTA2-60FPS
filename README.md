@@ -8,8 +8,8 @@ Compatible GTA2 version:
 # Changelog
 
 ## v1.07 & v1.06
-- [Experimental] Added .ini toggle for windowed/borderless mode. 
-- Added .ini toggle that lets you disable the arrow leading to the map level end when you reach required money/score (Arrow still appears if you are in the area where the level end zone is, so that you don't get lost!) (Set in ini hide_endlevel_arrow_if_far=1)
+- Added .ini toggle that lets you disable the blinking purple arrow leading to the level end when you reach required money (Arrow still appears if you are in the area where the level end zone is, so that you don't get lost!) 
+(Set in ini hide_endlevel_arrow_if_far=1)
 - Resolved stutter that rarely occured at high movement speed (We now trust DirectX directly to tell us information about vblanks)
 - Fixed cull distance of sprites not being sufficient with max zoom-out leading to occassional sprite pop-in.
 - Fixed collectible counter not counting properly the "reward" special tokens (such as token awarded for completing tutorial in downtown).
@@ -18,6 +18,7 @@ Compatible GTA2 version:
 - Fixed vanilla GTA2's crash related to bus/train array counter never being reset (happened when you restart game by going to main menu then back in-game 10+ times.)
 - Fixed sprite render limit being exceeded by handling it gracefully, (should solve rare crash when too much renders at once)
 - Structured ini config to be more digestable to read, (may add mod settings to in-game in future as alternative)
+- [Experimental] Added .ini toggle for windowed/borderless mode. 
 
 ## v1.05
 - Added "collectible_counter" .ini toggle, when set to 1 will let you see the amount of special tokens you collected so far on each map (special token = one of 50 gta 2 logo pickups)

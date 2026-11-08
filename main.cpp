@@ -3600,6 +3600,7 @@ static void Init()
 
 
 	// im lazy and im setting speed of text messages in-game here:
+	/*
 	DWORD o;
 	VirtualProtect((void*)0x4C6DC3, 64, PAGE_EXECUTE_READWRITE, &o);
 	memset((void*)0x4C6DC3, 0x90, 12);
@@ -3611,6 +3612,7 @@ static void Init()
 	magic[3] = 0x00;
 	magic[4] = 0x00;
 	VirtualProtect((void*)0x4C6DC3, 64, o, &o);
+	*/
 /*
 	if (g_bNoGangMeterBlink)
 	{
